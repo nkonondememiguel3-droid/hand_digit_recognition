@@ -170,7 +170,7 @@ int main( void )
 
   /* Main loop */
   SDL_Event event;
-  nk_input_begin( app.nk ); /* prime the first frame                   */
+  nk_input_begin( app.nk ); /* prime the first frame */
 
   while ( app.is_running )
   {
