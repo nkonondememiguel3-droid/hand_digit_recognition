@@ -38,6 +38,9 @@ add_library(
   recognition_lib
   src/tensor.c
   src/dataloader.c
+  src/activations.c
+  src/network.c
+  src/layers.c
 )
 target_include_directories(recognition_lib PUBLIC src/include/ src/utility/)
 target_link_libraries(
@@ -63,5 +66,15 @@ if(CRITERION_FOUND)
     target_link_libraries(test_tensor recognition_lib ${CRITERION_LIBRARIES} m)
     target_include_directories(test_tensor PRIVATE ${CRITERION_INCLUDE_DIRS})
     add_test(NAME tensor_tests COMMAND test_tensor)
+
+    add_executable(test_activations tests/test_activations.c)
+    target_link_libraries(test_activations recognition_lib ${CRITERION_LIBRARIES} m)
+    target_include_directories(test_activations PRIVATE ${CRITERION_INCLUDE_DIRS})
+    add_test(NAME activations_tests COMMAND test_activations)
+
+    add_executable(test_layers tests/test_layers.c)
+    target_link_libraries(test_layers recognition_lib ${CRITERION_LIBRARIES} m)
+    target_include_directories(test_layers PRIVATE ${CRITERION_INCLUDE_DIRS})
+    add_test(NAME layers_tests COMMAND test_layers)
 
 endif()
