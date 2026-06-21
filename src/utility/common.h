@@ -2,7 +2,7 @@
 #define hand_digit_recognition_common_h
 
 #if defined( __clang__ )
-#define ARENA_ALLOC __attribute__( ( malloc( arena_cannot_free_directly, 1 ) ) ) _Nullable
+#define ARENA_ALLOC __attribute__( ( malloc( ds_arena_destroy, 1 ) ) ) _Nullable
 #elif defined( __GNU__ ) && ( __GNU__ >= 11 )
 #define ARENA_ALLOC __attribute__( ( malloc( arena_cannot_free_directly, 1 ) ) )
 #else

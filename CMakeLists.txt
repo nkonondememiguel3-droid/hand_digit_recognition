@@ -3,7 +3,6 @@ project(hand_digit_recognition)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -56,8 +55,13 @@ if(CRITERION_FOUND)
     enable_testing()
 
     add_executable(test_dataloader tests/test_dataloader.c)
-    target_link_libraries(test_dataloader recognition_lib ${CRITERION_LIBRARIES})
+    target_link_libraries(test_dataloader recognition_lib ${CRITERION_LIBRARIES} m)
     target_include_directories(test_dataloader PRIVATE ${CRITERION_INCLUDE_DIRS})
     add_test(NAME dataloader_tests COMMAND test_dataloader)
+
+    add_executable(test_tensor tests/test_tensor.c)
+    target_link_libraries(test_tensor recognition_lib ${CRITERION_LIBRARIES} m)
+    target_include_directories(test_tensor PRIVATE ${CRITERION_INCLUDE_DIRS})
+    add_test(NAME tensor_tests COMMAND test_tensor)
 
 endif()
