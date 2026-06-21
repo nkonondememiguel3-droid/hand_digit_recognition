@@ -43,26 +43,33 @@ typedef struct
   SDL_Renderer *renderer;
   bool is_running;
 
-  _ds_arena_t_ arena;
+  _ds_arena_t_ arena;         /* long-lived: __dataset__ struct + open file handles */
+  _ds_arena_t_ scratch_arena; /* short-lived: current image/label tensors           */
+
   __dataset__ *dataset;
   uint32_t current_index;
+
+  _tensor_t *current_image; /* shape [1, IMG_HEIGHT, IMG_WIDTH], pixels normalised to [0,1] */
+  uint32_t current_label;
 
   SDL_Texture *mnist_texture;
   struct nk_image nk_mnist_image; /* nuklear-wrapped handle for nk_image() */
   struct nk_context *nk;
 } App;
 
-/* MNIST → SDL3 texture (28×28 RGBA, nearest-neighbour scaled by Nuklear later) */
-static SDL_Texture *create_mnist_texture( SDL_Renderer *renderer, const __mnist_image__ *images, uint32_t index )
-{
-  uint32_t rows = images->number_of_rows;
-  uint32_t cols = images->number_of_columns;
-  uint32_t offset = index * rows * cols;
+void white_theme( App app );
 
-  uint8_t rgba[28 * 28 * 4];
+/* MNIST tensor → SDL3 texture (28×28 RGBA, nearest-neighbour scaled by Nuklear later) */
+static SDL_Texture *create_mnist_texture( SDL_Renderer *renderer, const _tensor_t *image )
+{
+  uint32_t rows = (uint32_t)image->shape[1];
+  uint32_t cols = (uint32_t)image->shape[2];
+
+  uint8_t rgba[IMG_NATIVE_SIZE * IMG_NATIVE_SIZE * 4];
   for ( uint32_t i = 0; i < rows * cols; i++ )
   {
-    uint8_t v = images->pixels[offset + i];
+    /* load_image() normalises pixels to [0,1] float; scale back to a byte */
+    uint8_t v = (uint8_t)( image->data[i] * 255.0f + 0.5f );
     rgba[i * 4 + 0] = v;
     rgba[i * 4 + 1] = v;
     rgba[i * 4 + 2] = v;
@@ -76,15 +83,40 @@ static SDL_Texture *create_mnist_texture( SDL_Renderer *renderer, const __mnist_
   return tex;
 }
 
-/* Navigation: rebuild texture + nk_image handle for the new index */
-static void navigate( App *app, int delta )
+/* Navigation: stream in the image/label tensors for the new index into a
+ * brand-new scratch arena, then rebuild the texture + nk_image handle and
+ * discard the previous scratch arena (and the tensors it held). Using a
+ * fresh arena per navigation (rather than checkpoint/reset on a single
+ * long-lived one) avoids any ambiguity around resetting to a checkpoint
+ * taken before the arena had ever allocated anything. */
+static bool navigate( App *app, int delta )
 {
-  uint32_t count = app->dataset->images->header.count;
+  uint32_t count = app->dataset->image_header.count;
   app->current_index = ( app->current_index + count + (uint32_t)delta ) % count;
 
+  _ds_arena_t_ new_scratch = ds_arena_new( 0 );
+
+  _tensor_t *image = load_image( &new_scratch, app->dataset, (int)app->current_index );
+  _tensor_t *label = load_label( &new_scratch, app->dataset, (int)app->current_index );
+
+  if ( !image || !label )
+  {
+    SDL_LogError( SDL_LOG_CATEGORY_ERROR, "Failed to load image/label at index %u", app->current_index );
+    ds_arena_destroy( &new_scratch );
+    return false;
+  }
+
+  /* Swap in the new scratch arena; the old one (and its tensors, which
+     nothing references anymore once mnist_texture is rebuilt) is freed. */
+  ds_arena_destroy( &app->scratch_arena );
+  app->scratch_arena = new_scratch;
+  app->current_image = image;
+  app->current_label = (uint32_t)label->data[0];
+
   if ( app->mnist_texture ) SDL_DestroyTexture( app->mnist_texture );
-  app->mnist_texture = create_mnist_texture( app->renderer, app->dataset->images, app->current_index );
+  app->mnist_texture = create_mnist_texture( app->renderer, app->current_image );
   app->nk_mnist_image = nk_image_ptr( app->mnist_texture );
+  return true;
 }
 
 /* Entry point */
@@ -105,16 +137,34 @@ int main( void )
     return SDL_APP_FAILURE;
   }
 
-  /* Dataset */
+  /* Dataset: long-lived arena owns the __dataset__ struct + open FILE handles */
   app.arena = ds_arena_new( 0 );
-  app.dataset = load_dataset( &app.arena, IMG_PATH, LABEL_PATH );
+  app.dataset = dataset_init( &app.arena, IMG_PATH, LABEL_PATH );
   if ( !app.dataset )
   {
     SDL_LogError( SDL_LOG_CATEGORY_ERROR, "Failed to load MNIST" );
+    ds_arena_destroy( &app.arena );
+    SDL_DestroyRenderer( app.renderer );
+    SDL_DestroyWindow( app.window );
+    SDL_Quit();
     return SDL_APP_FAILURE;
   }
-  app.mnist_texture = create_mnist_texture( app.renderer, app.dataset->images, 0 );
-  app.nk_mnist_image = nk_image_ptr( app.mnist_texture );
+
+  /* Scratch arena: holds only the currently-displayed image/label tensors.
+     navigate() destroys and replaces this arena on every call, starting
+     with the very first one below. */
+  app.scratch_arena = ds_arena_new( 0 );
+
+  if ( !navigate( &app, 0 ) ) /* load index 0 */
+  {
+    dataset_close( app.dataset );
+    ds_arena_destroy( &app.scratch_arena );
+    ds_arena_destroy( &app.arena );
+    SDL_DestroyRenderer( app.renderer );
+    SDL_DestroyWindow( app.window );
+    SDL_Quit();
+    return SDL_APP_FAILURE;
+  }
 
   /* Nuklear init */
   app.nk = nk_sdl_init( app.window, app.renderer, nk_sdl_allocator() );
@@ -129,40 +179,7 @@ int main( void )
     nk_style_set_font( app.nk, &ui_font->handle );
   }
 
-  /* Whitish theme: override Nuklear's default dark colors */
-  {
-    struct nk_color table[NK_COLOR_COUNT];
-    nk_style_default( app.nk ); /* reset first */
-    table[NK_COLOR_TEXT] = nk_rgb( 30, 30, 30 );
-    table[NK_COLOR_WINDOW] = nk_rgb( 250, 250, 248 );
-    table[NK_COLOR_HEADER] = nk_rgb( 230, 230, 225 );
-    table[NK_COLOR_BORDER] = nk_rgb( 200, 200, 195 );
-    table[NK_COLOR_BUTTON] = nk_rgb( 225, 225, 220 );
-    table[NK_COLOR_BUTTON_HOVER] = nk_rgb( 210, 210, 205 );
-    table[NK_COLOR_BUTTON_ACTIVE] = nk_rgb( 195, 195, 190 );
-    table[NK_COLOR_TOGGLE] = nk_rgb( 230, 230, 225 );
-    table[NK_COLOR_TOGGLE_HOVER] = nk_rgb( 215, 215, 210 );
-    table[NK_COLOR_TOGGLE_CURSOR] = nk_rgb( 180, 180, 175 );
-    table[NK_COLOR_SELECT] = nk_rgb( 235, 235, 230 );
-    table[NK_COLOR_SELECT_ACTIVE] = nk_rgb( 200, 200, 195 );
-    table[NK_COLOR_SLIDER] = nk_rgb( 220, 220, 215 );
-    table[NK_COLOR_SLIDER_CURSOR] = nk_rgb( 180, 180, 175 );
-    table[NK_COLOR_SLIDER_CURSOR_HOVER] = nk_rgb( 165, 165, 160 );
-    table[NK_COLOR_SLIDER_CURSOR_ACTIVE] = nk_rgb( 150, 150, 145 );
-    table[NK_COLOR_PROPERTY] = nk_rgb( 225, 225, 220 );
-    table[NK_COLOR_EDIT] = nk_rgb( 255, 255, 255 );
-    table[NK_COLOR_EDIT_CURSOR] = nk_rgb( 30, 30, 30 );
-    table[NK_COLOR_COMBO] = nk_rgb( 225, 225, 220 );
-    table[NK_COLOR_CHART] = nk_rgb( 235, 235, 230 );
-    table[NK_COLOR_CHART_COLOR] = nk_rgb( 120, 150, 200 );
-    table[NK_COLOR_CHART_COLOR_HIGHLIGHT] = nk_rgb( 200, 80, 80 );
-    table[NK_COLOR_SCROLLBAR] = nk_rgb( 235, 235, 230 );
-    table[NK_COLOR_SCROLLBAR_CURSOR] = nk_rgb( 190, 190, 185 );
-    table[NK_COLOR_SCROLLBAR_CURSOR_HOVER] = nk_rgb( 170, 170, 165 );
-    table[NK_COLOR_SCROLLBAR_CURSOR_ACTIVE] = nk_rgb( 150, 150, 145 );
-    table[NK_COLOR_TAB_HEADER] = nk_rgb( 230, 230, 225 );
-    nk_style_from_table( app.nk, table );
-  }
+  white_theme( app );
 
   /* Main loop */
   SDL_Event event;
@@ -205,17 +222,16 @@ int main( void )
     int win_w, win_h;
     SDL_GetWindowSize( app.window, &win_w, &win_h );
 
-    uint32_t label_val = app.dataset->labels->label[app.current_index];
-    const __mnist_image__ *img = app.dataset->images;
-    uint32_t rows = img->number_of_rows, cols = img->number_of_columns;
-    uint32_t offset = app.current_index * rows * cols;
+    uint32_t label_val = app.current_label;
+    uint32_t rows = app.dataset->rows, cols = app.dataset->cols;
+    const _tensor_t *img = app.current_image;
 
     /* Single full-window Nuklear panel containing everything */
     if ( nk_begin( app.nk, "main", nk_rect( 0, 0, (float)win_w, (float)win_h ), NK_WINDOW_NO_SCROLLBAR ) )
     {
       /* Top: navigation + info bar */
       nk_layout_row_dynamic( app.nk, 40, 1 );
-      nk_labelf( app.nk, NK_TEXT_CENTERED, "Image %u / %u     Label: %u", app.current_index + 1, img->header.count, label_val );
+      nk_labelf( app.nk, NK_TEXT_CENTERED, "Image %u / %u     Label: %u", app.current_index + 1, app.dataset->image_header.count, label_val );
 
       nk_layout_row_dynamic( app.nk, 40, 2 );
       if ( nk_button_label( app.nk, "<  Prev" ) ) navigate( &app, -1 );
@@ -250,14 +266,16 @@ int main( void )
       {
         nk_style_set_font( app.nk, &mono_font->handle );
 
-        /* One Nuklear row per MNIST row, 28 small labels per row */
+        /* One Nuklear row per MNIST row, 28 small labels per row.
+           current_image->data is normalised to [0,1]; scale back to a
+           0-255 byte value for display, matching the raw IDX format. */
         float cell_w = 22.0f; /* fixed-width cell so columns line up like a grid */
         for ( uint32_t r = 0; r < rows; r++ )
         {
           nk_layout_row_static( app.nk, 20, (int)cell_w, (int)cols );
           for ( uint32_t c = 0; c < cols; c++ )
           {
-            uint8_t v = img->pixels[offset + r * cols + c];
+            uint8_t v = (uint8_t)( img->data[r * cols + c] * 255.0f + 0.5f );
             char buf[4];
             SDL_snprintf( buf, sizeof( buf ), "%u", v );
             nk_label( app.nk, buf, NK_TEXT_CENTERED );
@@ -289,7 +307,45 @@ int main( void )
   nk_sdl_shutdown( app.nk );
   SDL_DestroyRenderer( app.renderer );
   SDL_DestroyWindow( app.window );
+  dataset_close( app.dataset );
+  ds_arena_destroy( &app.scratch_arena );
   ds_arena_destroy( &app.arena );
   SDL_Quit();
   return SDL_APP_SUCCESS;
+}
+
+void white_theme( App app )
+{
+  /* Whitish theme: override Nuklear's default dark colors */
+  struct nk_color table[NK_COLOR_COUNT];
+  nk_style_default( app.nk ); /* reset first */
+  table[NK_COLOR_TEXT] = nk_rgb( 30, 30, 30 );
+  table[NK_COLOR_WINDOW] = nk_rgb( 250, 250, 248 );
+  table[NK_COLOR_HEADER] = nk_rgb( 230, 230, 225 );
+  table[NK_COLOR_BORDER] = nk_rgb( 200, 200, 195 );
+  table[NK_COLOR_BUTTON] = nk_rgb( 225, 225, 220 );
+  table[NK_COLOR_BUTTON_HOVER] = nk_rgb( 210, 210, 205 );
+  table[NK_COLOR_BUTTON_ACTIVE] = nk_rgb( 195, 195, 190 );
+  table[NK_COLOR_TOGGLE] = nk_rgb( 230, 230, 225 );
+  table[NK_COLOR_TOGGLE_HOVER] = nk_rgb( 215, 215, 210 );
+  table[NK_COLOR_TOGGLE_CURSOR] = nk_rgb( 180, 180, 175 );
+  table[NK_COLOR_SELECT] = nk_rgb( 235, 235, 230 );
+  table[NK_COLOR_SELECT_ACTIVE] = nk_rgb( 200, 200, 195 );
+  table[NK_COLOR_SLIDER] = nk_rgb( 220, 220, 215 );
+  table[NK_COLOR_SLIDER_CURSOR] = nk_rgb( 180, 180, 175 );
+  table[NK_COLOR_SLIDER_CURSOR_HOVER] = nk_rgb( 165, 165, 160 );
+  table[NK_COLOR_SLIDER_CURSOR_ACTIVE] = nk_rgb( 150, 150, 145 );
+  table[NK_COLOR_PROPERTY] = nk_rgb( 225, 225, 220 );
+  table[NK_COLOR_EDIT] = nk_rgb( 255, 255, 255 );
+  table[NK_COLOR_EDIT_CURSOR] = nk_rgb( 30, 30, 30 );
+  table[NK_COLOR_COMBO] = nk_rgb( 225, 225, 220 );
+  table[NK_COLOR_CHART] = nk_rgb( 235, 235, 230 );
+  table[NK_COLOR_CHART_COLOR] = nk_rgb( 120, 150, 200 );
+  table[NK_COLOR_CHART_COLOR_HIGHLIGHT] = nk_rgb( 200, 80, 80 );
+  table[NK_COLOR_SCROLLBAR] = nk_rgb( 235, 235, 230 );
+  table[NK_COLOR_SCROLLBAR_CURSOR] = nk_rgb( 190, 190, 185 );
+  table[NK_COLOR_SCROLLBAR_CURSOR_HOVER] = nk_rgb( 170, 170, 165 );
+  table[NK_COLOR_SCROLLBAR_CURSOR_ACTIVE] = nk_rgb( 150, 150, 145 );
+  table[NK_COLOR_TAB_HEADER] = nk_rgb( 230, 230, 225 );
+  nk_style_from_table( app.nk, table );
 }
