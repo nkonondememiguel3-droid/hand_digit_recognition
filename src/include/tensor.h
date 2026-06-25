@@ -42,12 +42,10 @@ extern _tensor_t *tensor_zeros( _ds_arena_t_ *a, int dimension, const int shape[
 /* Convenience: tensor filled with 1.0f (no gradient buffer) */
 extern _tensor_t *tensor_ones( _ds_arena_t_ *a, int dimension, const int shape[] );
 
-/*
- * tensor_random_normal — fill with samples drawn from N(mean, std²)
- * using the Box-Muller transform.
- * NOTE: call srand() before using this function.
- */
+// randomly initiliaze the learnable parmaters of the neuron network.
+// NOTE: YOU MUST CALL srand before using these functions.
 extern _tensor_t *tensor_random_normal( _ds_arena_t_ *a, int ndim, const int *shape, float mean, float std );
+extern _tensor_t *tensor_random_uniform( _ds_arena_t_ *arena, int ndim, const int *shape, float min, float max, bool gradient_required );
 
 /* Gradient helpers */
 

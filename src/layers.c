@@ -1,1 +1,129 @@
 #include "layers.h"
+#include "ds_arena.h"
+#include "tensor.h"
+#include <math.h>
+#include <stdbool.h>
+
+static _tensor_t *dense_forward( _ds_arena_t_ *arena, _layer_t *self, _tensor_t *input )
+{
+  if ( input->dimension != 2 )
+  {
+    fprintf( stderr, "dense_forward: expected 2D input [batch, features], got %dD\n", input->dimension );
+    return NULL;
+  }
+
+  if ( input->shape[1] != self->in_dimension )
+  {
+    fprintf( stderr, "dense_forward: input features %d != layer in_dimension %d\n", input->shape[1], self->in_dimension );
+    return NULL;
+  }
+
+  int batch_size = input->shape[0];        // number of samples.
+  int features = input->shape[1];          // features per sample.
+  int out_dimension = self->out_dimension; // number of output neurons.
+
+  int out_shape[] = { batch_size, out_dimension };
+  _tensor_t *output = tensor_zeros( arena, 2, out_shape );
+
+  for ( int sample = 0; sample < batch_size; sample++ )
+  {
+    int input_row = sample * features;
+    int output_row = sample * out_dimension;
+
+    // for each row of the output matrix.
+    for ( int neuron = 0; neuron < out_dimension; neuron++ )
+    {
+      int weight_row = neuron * features;
+
+      // TODO: Replace with BLAS latter for optimization purposes.
+      float sum = self->bias->data[neuron];
+      for ( int feature = 0; feature < features; feature++ ) sum += self->weights->data[weight_row + feature] * input->data[input_row + feature];
+      output->data[output_row + neuron] = sum;
+    }
+  }
+
+  // input must be allocated by a arena that outlives the baward pass.
+  self->last_input = input;
+
+  return output;
+}
+
+static _tensor_t *dense_backward( _ds_arena_t_ *arena, _layer_t *self, _tensor_t *output_gradients )
+{
+  if ( output_gradients->dimension != 2 )
+  {
+    fprintf( stderr, "dense_backward: expected 2D input [batch, features], got %dD\n", output_gradients->dimension );
+    return NULL;
+  }
+
+  if ( output_gradients->shape[1] != self->in_dimension )
+  {
+    fprintf( stderr, "dense_backward: input features %d != layer in_dimension %d\n", output_gradients->shape[1], self->in_dimension );
+    return NULL;
+  }
+
+  _tensor_t *input = self->last_input;
+  int batch_size = input->shape[0];
+  int features = input->shape[1];
+  int out_dimension = self->out_dimension;
+
+  // this is the input to the next previous layer.
+  int gradient_shape[] = { batch_size, features };
+  _tensor_t *input_gradients = tensor_zeros( arena, 2, gradient_shape );
+
+  for ( int sample = 0; sample < batch_size; sample++ )
+  {
+    int input_row = sample * features;
+    int gradient_row = sample * out_dimension;
+
+    for ( int neuron = 0; neuron < out_dimension; neuron++ )
+    {
+      int weight_row = neuron * features;
+
+      // TODO: Pre-transpose the weights and use a matrix multiplication to compute gradients_input = output_gradients * weights more efficiently.
+      // gradient of the current layer
+      float g = output_gradients->data[gradient_row + neuron];
+      self->bias->gradients[neuron] += g;
+
+      // TODO: Replace with BLAS latter for optimization purposes.
+      // compute the gradient of the weights
+      for ( int feature = 0; feature < features; feature++ )
+      {
+        // NOTE: zero layer->weights->gradient and layer->bias->gradients before each call to backward.
+        self->weights->gradients[weight_row + feature] += g * input->data[input_row + feature];
+        input_gradients->data[input_row + feature] += g * self->weights->data[weight_row + feature];
+      }
+    }
+  }
+
+  return input_gradients;
+}
+
+_layer_t *layer_create_dense( _ds_arena_t_ *arena, int in_features, int out_features )
+{
+  _layer_t *l = ARENA_NEW( arena, _layer_t );
+  l->layer_type = LAYER_DENSE;
+  l->layer_name = "dense";
+
+  l->in_dimension = in_features;
+  l->out_dimension = out_features;
+
+  // create the weights of the layer
+  // the weights has the dimension: output_dim * input_dim
+  int w_shape[] = { out_features, in_features };
+  float limit = sqrtf( 6.0f / ( in_features + out_features ) );
+  l->weights = tensor_random_uniform( arena, 2, w_shape, -limit, limit, true );
+
+  // create the bias of the layer
+  // the bias has the dimension of the output layer(the layer we'are multiply with)
+  int b_shape[] = { out_features };
+  l->bias = tensor_zeros( arena, 1, b_shape );
+  l->bias->requires_gradients = true;
+  l->bias->gradients = ARENA_ARRAY( arena, float, l->bias->size );
+
+  // feed forward & back forward functions
+  l->forward = dense_forward;
+  l->backward = dense_backward;
+
+  return l;
+}
