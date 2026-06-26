@@ -146,7 +146,7 @@ Test( tensor, clip_gradients_limits_magnitude )
 Test( tensor, normal_mean_near_target )
 {
   int shape[] = { 5000 };
-  _tensor_t *t = tensor_random_normal( &arena, 1, shape, 2.0f, 1.0f );
+  _tensor_t *t = tensor_random_normal( &arena, 1, shape, 2.0f, 1.0f, false );
 
   float mean = 0.0f;
   for ( int i = 0; i < t->size; i++ ) mean += t->data[i];
@@ -162,7 +162,7 @@ Test( tensor, normal_std_matches_he_init )
   float expected_std = sqrtf( 2.0f / ( C_in * k * k ) );
 
   int shape[] = { 10000 };
-  _tensor_t *t = tensor_random_normal( &arena, 1, shape, 0.0f, expected_std );
+  _tensor_t *t = tensor_random_normal( &arena, 1, shape, 0.0f, expected_std, false );
 
   float mean = 0.0f;
   for ( int i = 0; i < t->size; i++ ) mean += t->data[i];

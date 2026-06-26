@@ -61,7 +61,9 @@ _tensor_t *tensor_create( _ds_arena_t_ *a, int dimension, const int shape[], boo
  * Thin wrapper: no gradient buffer, data already zeroed by the arena.
  */
 _tensor_t *tensor_zeros( _ds_arena_t_ *a, int dimension, const int shape[] )
-{ return tensor_create( a, dimension, shape, false ); }
+{
+  return tensor_create( a, dimension, shape, false );
+}
 
 /* tensor_ones
  * Allocate and fill every element with 1.0f.
@@ -87,9 +89,9 @@ _tensor_t *tensor_ones( _ds_arena_t_ *a, int dimension, const int shape[] )
  *
  * Guard against u1 == 0 to prevent log(0) = -inf.
  */
-_tensor_t *tensor_random_normal( _ds_arena_t_ *a, int ndim, const int *shape, float mean, float std )
+_tensor_t *tensor_random_normal( _ds_arena_t_ *a, int dimension, const int *shape, float mean, float std, bool gradient_required )
 {
-  _tensor_t *t = tensor_create( a, ndim, shape, false );
+  _tensor_t *t = tensor_create( a, dimension, shape, gradient_required );
   if ( !t ) return NULL;
 
   for ( int i = 0; i < t->size; i += 2 )
@@ -106,6 +108,22 @@ _tensor_t *tensor_random_normal( _ds_arena_t_ *a, int ndim, const int *shape, fl
 
     t->data[i] = z0;
     if ( i + 1 < t->size ) t->data[i + 1] = z1;
+  }
+
+  return t;
+}
+
+
+_tensor_t *tensor_random_uniform( _ds_arena_t_ *arena, int ndim, const int *shape, float min, float max, bool gradient_required )
+{
+  _tensor_t *t = tensor_create( arena, ndim, shape, gradient_required );
+
+  float range = max - min;
+
+  for ( int i = 0; i < t->size; i++ )
+  {
+    float u = (float)rand() / (float)RAND_MAX;
+    t->data[i] = min + range * u;
   }
 
   return t;

@@ -36,15 +36,15 @@ typedef struct
  */
 extern _tensor_t *tensor_create( _ds_arena_t_ *a, int dimension, const int shape[], bool requires_gradients );
 
-/* Convenience: zeroed tensor (no gradient buffer) */
-extern _tensor_t *tensor_zeros( _ds_arena_t_ *a, int dimension, const int shape[] );
+/* Convenience: zeroed tensor */
+extern _tensor_t *tensor_zeros( _ds_arena_t_ *a, int dimension, const int shape[]);
 
 /* Convenience: tensor filled with 1.0f (no gradient buffer) */
 extern _tensor_t *tensor_ones( _ds_arena_t_ *a, int dimension, const int shape[] );
 
 // randomly initiliaze the learnable parmaters of the neuron network.
 // NOTE: YOU MUST CALL srand before using these functions.
-extern _tensor_t *tensor_random_normal( _ds_arena_t_ *a, int ndim, const int *shape, float mean, float std );
+extern _tensor_t *tensor_random_normal( _ds_arena_t_ *a, int ndim, const int *shape, float mean, float std , bool gradient_required);
 extern _tensor_t *tensor_random_uniform( _ds_arena_t_ *arena, int ndim, const int *shape, float min, float max, bool gradient_required );
 
 /* Gradient helpers */
@@ -55,17 +55,7 @@ extern void tensor_zero_gradients( _tensor_t *t );
 /* Clip every gradient element to [-clip_value, +clip_value]. */
 extern void tensor_clip_gradient( _tensor_t *t, float clip_value );
 
-/* Rank-generic index macros
- *
- * These expand to a single expression so they are safe on the right-hand
- * side of assignments and inside larger expressions.
- *
- * T1..T4  →  data element
- * G1..G4  →  gradient element (only valid when requires_gradients == true)
- *
- * Strides are pre-computed by tensor_create, so each access is:
- *   offset = i0*s0 + i1*s1 + ...   (no division, no modulo)
- */
+// quick access to the element of a tensor
 #define T1( t, i ) ( ( t )->data[( i ) * ( t )->strides[0]] )
 #define T2( t, i, j ) ( ( t )->data[( i ) * ( t )->strides[0] + ( j ) * ( t )->strides[1]] )
 #define T3( t, i, j, k ) ( ( t )->data[( i ) * ( t )->strides[0] + ( j ) * ( t )->strides[1] + ( k ) * ( t )->strides[2]] )

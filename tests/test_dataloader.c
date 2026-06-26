@@ -17,15 +17,15 @@
 static _ds_arena_t_ arena;
 
 void setup( void )
-{ arena = ds_arena_new( 0 ); }
+{
+  arena = ds_arena_new( 0 );
+}
 void teardown( void )
-{ ds_arena_destroy( &arena ); }
+{
+  ds_arena_destroy( &arena );
+}
 
 TestSuite( dataloader, .init = setup, .fini = teardown );
-
-/* ══════════════════════════════════════════════════════════════════════════
- * 1. HAPPY PATH — training set, headers
- * ══════════════════════════════════════════════════════════════════════════ */
 
 Test( dataloader, train_dataset_not_null )
 {
@@ -76,10 +76,6 @@ Test( dataloader, train_image_dimensions )
   dataset_close( ds );
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- * 2. HAPPY PATH — test set (t10k)
- * ══════════════════════════════════════════════════════════════════════════ */
-
 Test( dataloader, test_set_image_count )
 {
   __dataset__ *ds = dataset_init( &arena, TEST_IMG_PATH, TEST_LBL_PATH );
@@ -104,10 +100,6 @@ Test( dataloader, test_set_dimensions )
   cr_assert_eq( ds->cols, IMG_WIDTH );
   dataset_close( ds );
 }
-
-/* ══════════════════════════════════════════════════════════════════════════
- * 3. load_image() — per-index streaming tensor loads
- * ══════════════════════════════════════════════════════════════════════════ */
 
 Test( dataloader, load_image_returns_correct_shape )
 {
@@ -175,10 +167,6 @@ Test( dataloader, load_image_out_of_range_returns_null )
 
   dataset_close( ds );
 }
-
-/* ══════════════════════════════════════════════════════════════════════════
- * 4. load_label() — per-index streaming tensor loads
- * ══════════════════════════════════════════════════════════════════════════ */
 
 Test( dataloader, load_label_returns_correct_shape )
 {
@@ -253,10 +241,6 @@ Test( dataloader, load_label_out_of_range_returns_null )
   dataset_close( ds );
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- * 5. IMAGE ↔ LABEL ALIGNMENT
- * ══════════════════════════════════════════════════════════════════════════ */
-
 Test( dataloader, image_and_label_counts_match )
 {
   __dataset__ *ds = dataset_init( &arena, TRAIN_IMG_PATH, TRAIN_LBL_PATH );
@@ -264,10 +248,6 @@ Test( dataloader, image_and_label_counts_match )
   cr_assert_eq( ds->image_header.count, ds->label_header.count, "Image count %u != label count %u", ds->image_header.count, ds->label_header.count );
   dataset_close( ds );
 }
-
-/* ══════════════════════════════════════════════════════════════════════════
- * 6. ERROR HANDLING — bad paths
- * ══════════════════════════════════════════════════════════════════════════ */
 
 Test( dataloader, null_on_bad_image_path )
 {
