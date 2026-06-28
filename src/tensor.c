@@ -147,3 +147,16 @@ void tensor_clip_gradient( _tensor_t *t, float clip_value )
     if ( t->gradients[i] < -clip_value ) t->gradients[i] = -clip_value;
   }
 }
+
+bool tensor_add_inplace( _tensor_t *dst, const _tensor_t *source )
+{
+  if ( dst->size != source->size )
+  {
+    fprintf( stderr, "tensor_add_inplace: size mismatch %d vs %d\n", dst->size, source->size );
+    return false;
+  }
+
+  for ( int i = 0; i < dst->size; i++ ) dst->data[i] += source->data[i];
+
+  return true;
+}

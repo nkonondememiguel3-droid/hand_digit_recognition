@@ -41,4 +41,6 @@ typedef struct _layer_
 
 extern _layer_t *layer_create_dense( _ds_arena_t_ *arena, int in_features, int out_features );
 
+extern _layer_t *layer_create_sigmoid(_ds_arena_t_ *arena);
+
 #endif // hand_digit_recognition_layers_h

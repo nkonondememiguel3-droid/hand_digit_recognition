@@ -3,6 +3,7 @@
 #include "tensor.h"
 #include <math.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 static _tensor_t *dense_forward( _ds_arena_t_ *arena, _layer_t *self, _tensor_t *input )
 {
@@ -118,4 +119,57 @@ _layer_t *layer_create_dense( _ds_arena_t_ *arena, int in_features, int out_feat
   l->backward = dense_backward;
 
   return l;
+}
+
+static _tensor_t *sigmoid_forward( _ds_arena_t_ *arena, _layer_t *self, _tensor_t *input )
+{
+  // y = 1 / (1 + expf(-x))
+  _tensor_t *output = tensor_zeros( arena, input->dimension, input->shape );
+  if ( !output ) return NULL;
+
+  for ( int i = 0; i < input->size; i++ ) output->data[i] = 1.0f / ( 1.0f + expf( -input->data[i] ) );
+
+  // cache the output y = σ(x) - backward uses it directly, no recomputation
+  self->last_input = output;
+  return output;
+}
+
+static _tensor_t *sigmoid_backward( _ds_arena_t_ *arena, _layer_t *self, _tensor_t *output_gradient )
+{
+  // y = y' * sig(x).(1 - sig(x))
+  _tensor_t *sigmoid_out = self->last_input; // this has already been computed during forward pass
+  if ( !sigmoid_out )
+  {
+    fprintf( stderr, "sigmoid_backward: last_input is NULL — was forward() called?\n" );
+    return NULL;
+  }
+
+  _tensor_t *input_gradients = tensor_zeros( arena, sigmoid_out->dimension, sigmoid_out->shape );
+  if ( !input_gradients ) return NULL;
+
+  for ( int i = 0; i < sigmoid_out->size; ++i )
+  {
+    float s = sigmoid_out->data[i];
+    input_gradients->data[i] = output_gradient->data[i] * s * ( 1.0f - s );
+  }
+
+  return input_gradients;
+}
+
+_layer_t *layer_create_sigmoid( _ds_arena_t_ *arena )
+{
+  _layer_t *sigmoid = ARENA_NEW( arena, _layer_t );
+
+  sigmoid->layer_type = LAYER_SIGMOID;
+  sigmoid->layer_name = "sigmoid";
+
+  sigmoid->weights = NULL;
+  sigmoid->bias = NULL;
+  sigmoid->in_dimension = 0;
+  sigmoid->out_dimension = 0;
+
+  sigmoid->forward = sigmoid_forward;
+  sigmoid->backward = sigmoid_backward;
+
+  return sigmoid;
 }

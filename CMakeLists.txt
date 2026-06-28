@@ -41,7 +41,9 @@ add_library(
   src/activations.c
   src/network.c
   src/layers.c
+  src/loses.c
 )
+
 target_include_directories(recognition_lib PUBLIC src/include/ src/utility/)
 target_link_libraries(
   recognition_lib PUBLIC
@@ -76,5 +78,15 @@ if(CRITERION_FOUND)
     target_link_libraries(test_layers recognition_lib ${CRITERION_LIBRARIES} m)
     target_include_directories(test_layers PRIVATE ${CRITERION_INCLUDE_DIRS})
     add_test(NAME layers_tests COMMAND test_layers)
+
+    add_executable(test_loses tests/test_loses.c)
+    target_link_libraries(test_loses recognition_lib ${CRITERION_LIBRARIES} m)
+    target_include_directories(test_loses PRIVATE ${CRITERION_INCLUDE_DIRS})
+    add_test(NAME loses_tests COMMAND test_loses)
+
+    add_executable(test_network tests/test_network.c)
+    target_link_libraries(test_network recognition_lib ${CRITERION_LIBRARIES} m)
+    target_include_directories(test_network PRIVATE ${CRITERION_INCLUDE_DIRS})
+    add_test(NAME network_tests COMMAND test_network)
 
 endif()

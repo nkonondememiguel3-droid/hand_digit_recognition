@@ -37,14 +37,14 @@ typedef struct
 extern _tensor_t *tensor_create( _ds_arena_t_ *a, int dimension, const int shape[], bool requires_gradients );
 
 /* Convenience: zeroed tensor */
-extern _tensor_t *tensor_zeros( _ds_arena_t_ *a, int dimension, const int shape[]);
+extern _tensor_t *tensor_zeros( _ds_arena_t_ *a, int dimension, const int shape[] );
 
 /* Convenience: tensor filled with 1.0f (no gradient buffer) */
 extern _tensor_t *tensor_ones( _ds_arena_t_ *a, int dimension, const int shape[] );
 
 // randomly initiliaze the learnable parmaters of the neuron network.
 // NOTE: YOU MUST CALL srand before using these functions.
-extern _tensor_t *tensor_random_normal( _ds_arena_t_ *a, int ndim, const int *shape, float mean, float std , bool gradient_required);
+extern _tensor_t *tensor_random_normal( _ds_arena_t_ *a, int ndim, const int *shape, float mean, float std, bool gradient_required );
 extern _tensor_t *tensor_random_uniform( _ds_arena_t_ *arena, int ndim, const int *shape, float min, float max, bool gradient_required );
 
 /* Gradient helpers */
@@ -67,5 +67,8 @@ extern void tensor_clip_gradient( _tensor_t *t, float clip_value );
 #define G3( t, i, j, k ) ( ( t )->gradients[( i ) * ( t )->strides[0] + ( j ) * ( t )->strides[1] + ( k ) * ( t )->strides[2]] )
 #define G4( t, n, c, h, w )                                                                                                                          \
   ( ( t )->gradients[( n ) * ( t )->strides[0] + ( c ) * ( t )->strides[1] + ( h ) * ( t )->strides[2] + ( w ) * ( t )->strides[3]] )
+
+// inplace addition between two tensors.
+extern bool tensor_add_inplace( _tensor_t *dst, const _tensor_t *source );
 
 #endif /* hand_digit_recognition_tensor_h */

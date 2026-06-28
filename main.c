@@ -43,17 +43,17 @@ typedef struct
   SDL_Renderer *renderer;
   bool is_running;
 
-  _ds_arena_t_ arena;         /* long-lived: __dataset__ struct + open file handles */
-  _ds_arena_t_ scratch_arena; /* short-lived: current image/label tensors           */
+  _ds_arena_t_ arena;
+  _ds_arena_t_ scratch_arena;
 
   __dataset__ *dataset;
   uint32_t current_index;
 
-  _tensor_t *current_image; /* shape [1, IMG_HEIGHT, IMG_WIDTH], pixels normalised to [0,1] */
+  _tensor_t *current_image;
   uint32_t current_label;
 
   SDL_Texture *mnist_texture;
-  struct nk_image nk_mnist_image; /* nuklear-wrapped handle for nk_image() */
+  struct nk_image nk_mnist_image;
   struct nk_context *nk;
 } App;
 
