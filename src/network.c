@@ -1,7 +1,6 @@
 #include "ds_arena.h"
 #include "networkd.h"
 #include "tensor.h"
-#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 
