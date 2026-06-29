@@ -10,13 +10,9 @@
 static _ds_arena_t_ arena;
 
 void setup( void )
-{
-  arena = ds_arena_new( 0 );
-}
+{ arena = ds_arena_new( 0 ); }
 void teardown( void )
-{
-  ds_arena_destroy( &arena );
-}
+{ ds_arena_destroy( &arena ); }
 
 TestSuite( loss, .init = setup, .fini = teardown );
 
@@ -106,21 +102,27 @@ Test( loss, sce_loss_perfect_prediction_near_zero )
   _tensor_t *labels = make_one_hot( &arena, 1, 3, label );
 
   _loss_result_t r = loss_softmax_cross_entropy( &arena, logits, labels );
-  cr_log_warn("value of loss: %f\n", r.loss->data[0]);
+  cr_log_warn( "value of loss: %f\n", r.loss->data[0] );
   cr_assert( r.loss->data[0] < 0.01f, "Loss should be near 0 for perfect prediction, got %.6f", r.loss->data[0] );
 }
 
 Test( loss, sce_loss_worst_prediction_is_large )
 {
-  /* Large logit for WRONG class → loss should be large */
   float logits_data[] = { -100.0f, -100.0f, 100.0f };
-  int label[] = { 0 }; /* correct class is 0, but model predicts 2 */
+  int label[] = { 0 };
   _tensor_t *logits = make_logits( &arena, 1, 3, logits_data );
   _tensor_t *labels = make_one_hot( &arena, 1, 3, label );
 
   _loss_result_t r = loss_softmax_cross_entropy( &arena, logits, labels );
-  cr_log_warn("value of loss: %f\n", r.loss->data[0]);
-  cr_assert( r.loss->data[0] > 50.0f, "Loss should be large for wrong prediction, got %.4f", r.loss->data[0] );
+
+  float max_clamped_loss = -logf( 1e-7f );
+
+  cr_assert( r.loss->data[0] > 10.0f, "Loss should be large for wrong prediction, got %.4f", r.loss->data[0] );
+
+  cr_assert_float_eq( r.loss->data[0], max_clamped_loss, 1e-3f,
+                      "Confidently wrong prediction should hit epsilon clamp: "
+                      "expected %.4f, got %.4f",
+                      max_clamped_loss, r.loss->data[0] );
 }
 
 Test( loss, sce_loss_uniform_logits_equals_log_classes )

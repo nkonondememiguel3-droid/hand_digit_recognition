@@ -99,7 +99,7 @@ _network_t *network_create( _ds_arena_t_ *persist_arena )
   net->tail = NULL;
   net->number_layers = 0;
   net->forward = network_forward;
-  net->backwar = network_backward;
+  net->backward = network_backward;
 
   return net;
 }

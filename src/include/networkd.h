@@ -32,7 +32,7 @@ struct _network_
   int number_layers;
 
   _tensor_t *( *forward )( _network_t *self, _ds_arena_t_ *batch_arena, _tensor_t *input );
-  _tensor_t *( *backwar )( _network_t *self, _ds_arena_t_ *batch_arena, _tensor_t *loss_gradients );
+  _tensor_t *( *backward )( _network_t *self, _ds_arena_t_ *batch_arena, _tensor_t *loss_gradients );
 };
 
 extern _network_t *network_create( _ds_arena_t_ *persist_arena );
