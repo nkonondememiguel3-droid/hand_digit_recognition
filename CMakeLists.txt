@@ -42,6 +42,8 @@ add_library(
   src/network.c
   src/layers.c
   src/loses.c
+  src/optimizer.c
+  src/training.c
 )
 
 target_include_directories(recognition_lib PUBLIC src/include/ src/utility/)
