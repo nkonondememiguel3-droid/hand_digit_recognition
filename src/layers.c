@@ -173,3 +173,51 @@ _layer_t *layer_create_sigmoid( _ds_arena_t_ *arena )
 
   return sigmoid;
 }
+
+// relu layer
+
+static _tensor_t *relu_forward( _ds_arena_t_ *arena, _layer_t *self, _tensor_t *input )
+{
+  _tensor_t *output = tensor_zeros( arena, input->dimension, input->shape );
+  if ( !output ) return NULL;
+
+  for ( int i = 0; i < input->size; i++ ) output->data[i] = input->data[i] > 0.0f ? input->data[i] : 0.0f;
+
+  self->last_input = output;
+  return output;
+}
+
+static _tensor_t *relu_backward( _ds_arena_t_ *arena, _layer_t *self, _tensor_t *output_gradient )
+{
+  _tensor_t *input = self->last_input;
+  if ( !input )
+  {
+    fprintf( stderr, "relu_backward: last_input is NULL\n" );
+    return NULL;
+  }
+
+  _tensor_t *grad = tensor_zeros( arena, input->dimension, input->shape );
+  if ( !grad ) return NULL;
+
+  for ( int i = 0; i < input->size; i++ ) grad->data[i] = input->data[i] > 0.0f ? output_gradient->data[i] : 0.0f;
+
+  return grad;
+}
+
+_layer_t *layer_create_relu( _ds_arena_t_ *arena )
+{
+  _layer_t *relu = ARENA_NEW( arena, _layer_t );
+
+  relu->layer_type = LAYER_RELU;
+  relu->layer_name = "relu";
+
+  relu->weights = NULL;
+  relu->bias = NULL;
+  relu->in_dimension = 0;
+  relu->out_dimension = 0;
+
+  relu->forward = relu_forward;
+  relu->backward = relu_backward;
+
+  return relu;
+}

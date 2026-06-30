@@ -30,7 +30,7 @@ static inline _training_config_t training_config_defaults( void )
     .epochs = 10,
     .batch_size = 64,
     .num_classes = 10,
-    .label_smoothing = 1.0f,
+    .label_smoothing = 0.0f,
   };
 }
 

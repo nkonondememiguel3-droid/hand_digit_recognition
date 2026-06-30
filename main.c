@@ -1,3 +1,4 @@
+#include "network_config.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_render.h>
@@ -24,8 +25,6 @@
 
 #include "dataloader.h"
 #include "ds_arena.h"
-#include "layers.h"
-/* #include "loses.h" */
 #include "networkd.h"
 #include "optimizer.h"
 #include "tensor.h"
@@ -51,7 +50,8 @@ typedef enum
 {
   TAB_VIEWER = 0,
   TAB_TRAINING,
-  TAB_TESTING
+  TAB_TESTING,
+  TAB_CONFIG,
 } _app_tab_t;
 
 /* Test result for a single image */
@@ -122,14 +122,20 @@ typedef struct
   struct nk_context *nk;
   struct nk_font *mono_font;
   struct nk_font *ui_font;
+
+  // architecture configuration
+  _network_config_t config;
+  int config_editing_layer;
 } App;
+
+static void render_config_panel( App *app, float x, float y, float w, float h );
+static void apply_network_config( App *app );
 
 /* Forward declarations */
 static void apply_white_theme( struct nk_context *nk );
 static bool navigate_viewer( App *app, int delta );
 static bool navigate_test( App *app, int delta );
 static SDL_Texture *tensor_to_texture( SDL_Renderer *r, const _tensor_t *img );
-static void build_network( App *app );
 static void run_inference( App *app, int idx );
 static void render_tab_bar( App *app, float w );
 static void render_viewer_panel( App *app, float x, float y, float w, float h );
@@ -152,6 +158,8 @@ int main( void )
   app.is_running = true;
   app.active_tab = TAB_VIEWER;
   app.test_index = 0;
+  app.config = network_config_defaults();
+  app.config_editing_layer = -1;
 
   if ( !SDL_CreateWindowAndRenderer( "Hand Written Digit Recognizer (HWDR)", WINDOW_W, WINDOW_H, SDL_WINDOW_RESIZABLE, &app.window, &app.renderer ) )
   {
@@ -179,9 +187,13 @@ int main( void )
     return SDL_APP_FAILURE;
   }
 
-  build_network( &app );
   app.training_state = training_state_create( &app.arena );
   app.eval_mutex = SDL_CreateMutex();
+
+  apply_network_config( &app );
+
+  app.train_ds = dataset_init( &app.arena, TRAIN_IMG_PATH, TRAIN_LBL_PATH );
+  app.test_ds = dataset_init( &app.arena, TEST_IMG_PATH, TEST_LBL_PATH );
 
   app.nk = nk_sdl_init( app.window, app.renderer, nk_sdl_allocator() );
   {
@@ -226,6 +238,9 @@ int main( void )
           if ( app.active_tab == TAB_VIEWER ) navigate_viewer( &app, -100 );
           if ( app.active_tab == TAB_TESTING ) navigate_test( &app, -100 );
           break;
+          /* case TAB_CONFIG: */
+          /*   render_config_panel( &app, 0, content_y, (float)win_w, content_h ); */
+          /*   break; */
         }
       }
 
@@ -258,6 +273,9 @@ int main( void )
       break;
     case TAB_TESTING:
       render_testing_panel( &app, 0, content_y, (float)win_w, content_h );
+      break;
+    case TAB_CONFIG:
+      render_config_panel( &app, 0, content_y, (float)win_w, content_h );
       break;
     }
 
@@ -301,21 +319,6 @@ int main( void )
   ds_arena_destroy( &app.arena );
   SDL_Quit();
   return SDL_APP_SUCCESS;
-}
-
-/* ════════════════════════════════════════════════════════════════════════
- * Network
- * ════════════════════════════════════════════════════════════════════════ */
-static void build_network( App *app )
-{
-  app->network = network_create( &app->weight_arena );
-  network_add_layer( &app->weight_arena, app->network, layer_create_dense( &app->weight_arena, 784, 128 ) );
-  network_add_layer( &app->weight_arena, app->network, layer_create_sigmoid( &app->weight_arena ) );
-  network_add_layer( &app->weight_arena, app->network, layer_create_dense( &app->weight_arena, 128, 64 ) );
-  network_add_layer( &app->weight_arena, app->network, layer_create_sigmoid( &app->weight_arena ) );
-  network_add_layer( &app->weight_arena, app->network, layer_create_dense( &app->weight_arena, 64, 10 ) );
-
-  app->optimizer = optimizer_create_adam( &app->weight_arena, app->network, optimizer_adam_defaults() );
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -527,10 +530,11 @@ static void render_tab_bar( App *app, float w )
 {
   if ( nk_begin( app->nk, "tabs", nk_rect( 0, 0, w, 44 ), NK_WINDOW_NO_SCROLLBAR ) )
   {
-    nk_layout_row_static( app->nk, 36, (int)( w / 3 ) - 4, 3 );
+    nk_layout_row_static( app->nk, 36, (int)( w / 4 ) - 4, 4 );
     if ( nk_button_label( app->nk, "Viewer + Training" ) ) app->active_tab = TAB_VIEWER;
     if ( nk_button_label( app->nk, "Training" ) ) app->active_tab = TAB_TRAINING;
     if ( nk_button_label( app->nk, "Testing" ) ) app->active_tab = TAB_TESTING;
+    if ( nk_button_label( app->nk, "Architecture" ) ) app->active_tab = TAB_CONFIG;
   }
   nk_end( app->nk );
 }
@@ -612,26 +616,40 @@ static void render_training_panel( App *app, float x, float y, float w, float h 
   }
 
   nk_layout_row_dynamic( app->nk, 22, 1 );
-  nk_label( app->nk, "Network: 784 -> 128 -> 64 -> 10  (Adam lr=1e-3)", NK_TEXT_LEFT );
-
+  char arch_summary[256];
+  network_config_summary( &app->config, arch_summary, sizeof( arch_summary ) );
+  nk_labelf( app->nk, NK_TEXT_LEFT, "Network: %s  (%s lr=%.5f)", arch_summary, app->config.optimizer == CONFIG_OPTIMIZER_ADAM ? "Adam" : "SGD",
+             app->config.learning_rate );
   nk_layout_row_dynamic( app->nk, 36, 3 );
+
   if ( !m->is_training )
   {
-    if ( nk_button_label( app->nk, "Start Training" ) )
+    bool can_start = app->config.is_applied && !app->config.is_dirty;
+
+    if ( !can_start )
     {
-      app->training_ctx = ARENA_NEW( &app->weight_arena, _training_ctx_t );
-      app->training_ctx->state = app->training_state;
-      app->training_ctx->network = app->network;
-      app->training_ctx->optimizer = app->optimizer;
-      app->training_ctx->train_ds = app->train_ds;
-      app->training_ctx->test_ds = app->test_ds;
-      app->training_ctx->config = training_config_defaults();
-      app->training_ctx->weight_arena = app->weight_arena;
-      app->training_ctx->batch_arena = ds_arena_new( 0 );
-      app->training_thread = training_start( app->training_ctx );
+      nk_label( app->nk, "Configure and Apply a network in the Architecture tab first.", NK_TEXT_LEFT );
+      nk_label( app->nk, "", NK_TEXT_LEFT );
+      nk_label( app->nk, "", NK_TEXT_LEFT );
     }
-    nk_label( app->nk, "", NK_TEXT_LEFT );
-    nk_label( app->nk, "", NK_TEXT_LEFT );
+    else
+    {
+      if ( nk_button_label( app->nk, "Start Training" ) )
+      {
+        app->training_ctx = ARENA_NEW( &app->weight_arena, _training_ctx_t );
+        app->training_ctx->state = app->training_state;
+        app->training_ctx->network = app->network;
+        app->training_ctx->optimizer = app->optimizer;
+        app->training_ctx->train_ds = app->train_ds;
+        app->training_ctx->test_ds = app->test_ds;
+        app->training_ctx->config = training_config_defaults();
+        app->training_ctx->weight_arena = app->weight_arena;
+        app->training_ctx->batch_arena = ds_arena_new( 0 );
+        app->training_thread = training_start( app->training_ctx );
+      }
+      nk_label( app->nk, "", NK_TEXT_LEFT );
+      nk_label( app->nk, "", NK_TEXT_LEFT );
+    }
   }
   else
   {
@@ -910,4 +928,239 @@ static void apply_white_theme( struct nk_context *nk )
   table[NK_COLOR_SCROLLBAR_CURSOR_ACTIVE] = nk_rgb( 150, 150, 145 );
   table[NK_COLOR_TAB_HEADER] = nk_rgb( 230, 230, 225 );
   nk_style_from_table( nk, table );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * apply_network_config — rebuild network + optimizer from current config
+ * ════════════════════════════════════════════════════════════════════════ */
+static void apply_network_config( App *app )
+{
+  /* Refuse to rebuild while training is in progress — the training
+     thread holds raw pointers into the old network/weight_arena, and
+     swapping them out from under it would be a use-after-free.        */
+  SDL_LockMutex( app->training_state->mutex );
+  bool training_active = app->training_state->is_training;
+  SDL_UnlockMutex( app->training_state->mutex );
+
+  if ( training_active )
+  {
+    SDL_LogWarn( SDL_LOG_CATEGORY_APPLICATION, "Cannot apply config while training is in progress" );
+    return;
+  }
+
+  /* Destroy the old weight arena and everything in it (old network,
+     old optimizer, old layer weights) — then build fresh.             */
+  ds_arena_destroy( &app->weight_arena );
+  app->weight_arena = ds_arena_new( 0 );
+
+  _network_t *new_net = NULL;
+  _optimizer_t *new_opt = NULL;
+
+  if ( !network_config_build( &app->weight_arena, &app->config, &new_net, &new_opt ) )
+  {
+    SDL_LogError( SDL_LOG_CATEGORY_APPLICATION, "Failed to build network from config" );
+    /* Re-create an empty arena so we don't leave a destroyed one behind */
+    app->config.is_applied = false;
+    return;
+  }
+
+  app->network = new_net;
+  app->optimizer = new_opt;
+
+  /* Reset training metrics — old loss/accuracy history belongs to the
+     previous architecture and is meaningless for the new one.         */
+  SDL_LockMutex( app->training_state->mutex );
+  app->training_state->history_head = 0;
+  app->training_state->history_count = 0;
+  app->training_state->epoch_loss = 0.0f;
+  app->training_state->epoch_acc = 0.0f;
+  app->training_state->epoch = 0;
+  app->training_state->batch = 0;
+  SDL_UnlockMutex( app->training_state->mutex );
+
+  /* Clear any stale test result — it referenced the old network's output */
+  app->test_result.has_result = false;
+
+  app->config.is_applied = true;
+  app->config.is_dirty = false;
+
+  SDL_Log( "Network rebuilt successfully." );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Architecture configuration panel
+ * ════════════════════════════════════════════════════════════════════════ */
+static void render_config_panel( App *app, float x, float y, float w, float h )
+{
+  _network_config_t *cfg = &app->config;
+
+  if ( !nk_begin( app->nk, "config", nk_rect( x, y, w, h ), NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR ) )
+  {
+    nk_end( app->nk );
+    return;
+  }
+
+  SDL_LockMutex( app->training_state->mutex );
+  bool training_active = app->training_state->is_training;
+  SDL_UnlockMutex( app->training_state->mutex );
+
+  if ( training_active )
+  {
+    nk_layout_row_dynamic( app->nk, 28, 1 );
+    nk_label_colored( app->nk, "Stop training before editing the architecture.", NK_TEXT_LEFT, nk_rgb( 220, 60, 60 ) );
+  }
+
+  /* ── Fixed input/output dims (display only) ── */
+  nk_layout_row_dynamic( app->nk, 24, 1 );
+  nk_labelf( app->nk, NK_TEXT_LEFT, "Input dimension: %d (fixed, 28x28 MNIST pixels)", CONFIG_INPUT_DIM );
+
+  /* ── Hidden layers list ── */
+  nk_layout_row_dynamic( app->nk, 24, 1 );
+  nk_label( app->nk, "Hidden layers:", NK_TEXT_LEFT );
+
+  for ( int i = 0; i < cfg->num_hidden_layers; i++ )
+  {
+    nk_layout_row_begin( app->nk, NK_DYNAMIC, 32, 5 );
+
+    nk_layout_row_push( app->nk, 0.10f );
+    nk_labelf( app->nk, NK_TEXT_LEFT, "L%d", i + 1 );
+
+    /* Dimension slider */
+    nk_layout_row_push( app->nk, 0.35f );
+    int old_dim = cfg->hidden_layers[i].dimension;
+    int new_dim = old_dim;
+    nk_slider_int( app->nk, CONFIG_MIN_DIM, &new_dim, CONFIG_MAX_DIM, 1 );
+    if ( new_dim != old_dim )
+    {
+      cfg->hidden_layers[i].dimension = new_dim;
+      cfg->is_dirty = true;
+    }
+
+    /* Dimension value, editable as a number too */
+    nk_layout_row_push( app->nk, 0.12f );
+    nk_labelf( app->nk, NK_TEXT_CENTERED, "%d", cfg->hidden_layers[i].dimension );
+
+    /* Activation dropdown */
+    nk_layout_row_push( app->nk, 0.28f );
+    static const char *activation_names[] = { "ReLU", "Sigmoid" };
+    int act_idx = (int)cfg->hidden_layers[i].activation;
+    int new_act_idx = nk_combo( app->nk, activation_names, 2, act_idx, 24, nk_vec2( 140, 80 ) );
+    if ( new_act_idx != act_idx )
+    {
+      cfg->hidden_layers[i].activation = (_config_activation_t)new_act_idx;
+      cfg->is_dirty = true;
+    }
+
+    /* Remove button — disabled if only one layer remains */
+    nk_layout_row_push( app->nk, 0.15f );
+    if ( cfg->num_hidden_layers > 1 )
+    {
+      if ( nk_button_label( app->nk, "Remove" ) )
+      {
+        for ( int j = i; j < cfg->num_hidden_layers - 1; j++ ) cfg->hidden_layers[j] = cfg->hidden_layers[j + 1];
+        cfg->num_hidden_layers--;
+        cfg->is_dirty = true;
+      }
+    }
+    else { nk_label( app->nk, "", NK_TEXT_LEFT ); /* keep layout aligned */ }
+
+    nk_layout_row_end( app->nk );
+  }
+
+  /* ── Add layer button ── */
+  nk_layout_row_dynamic( app->nk, 32, 1 );
+  if ( cfg->num_hidden_layers < CONFIG_MAX_HIDDEN_LAYERS )
+  {
+    if ( nk_button_label( app->nk, "+ Add Hidden Layer" ) )
+    {
+      cfg->hidden_layers[cfg->num_hidden_layers].dimension = 64;
+      cfg->hidden_layers[cfg->num_hidden_layers].activation = CONFIG_ACTIVATION_RELU;
+      cfg->num_hidden_layers++;
+      cfg->is_dirty = true;
+    }
+  }
+  else { nk_label( app->nk, "Maximum hidden layers reached", NK_TEXT_CENTERED ); }
+
+  /* ── Fixed output dim (display only) ── */
+  nk_layout_row_dynamic( app->nk, 24, 1 );
+  nk_labelf( app->nk, NK_TEXT_LEFT, "Output dimension: %d (fixed, one per digit class)", CONFIG_OUTPUT_DIM );
+
+  /* ── Optimizer selection ── */
+  nk_layout_row_dynamic( app->nk, 8, 1 );
+  nk_label( app->nk, "", NK_TEXT_LEFT ); /* spacer */
+
+  nk_layout_row_dynamic( app->nk, 24, 1 );
+  nk_label( app->nk, "Optimizer:", NK_TEXT_LEFT );
+
+  nk_layout_row_dynamic( app->nk, 32, 2 );
+  static const char *optimizer_names[] = { "Adam", "SGD" };
+  int opt_idx = (int)cfg->optimizer;
+  int new_opt_idx = nk_combo( app->nk, optimizer_names, 2, opt_idx, 24, nk_vec2( 200, 60 ) );
+  if ( new_opt_idx != opt_idx )
+  {
+    cfg->optimizer = (_config_optimizer_t)new_opt_idx;
+    cfg->is_dirty = true;
+  }
+
+  nk_label( app->nk, "", NK_TEXT_LEFT ); /* alignment spacer */
+
+  /* ── Learning rate slider ── */
+  nk_layout_row_dynamic( app->nk, 24, 1 );
+  nk_labelf( app->nk, NK_TEXT_LEFT, "Learning rate: %.5f", cfg->learning_rate );
+
+  nk_layout_row_dynamic( app->nk, 24, 1 );
+  float old_lr = cfg->learning_rate;
+  float new_lr = old_lr;
+  /* Slider over a log-ish practical range: 0.00001 .. 0.1 */
+  nk_slider_float( app->nk, 0.00001f, &new_lr, 0.1f, 0.00001f );
+  if ( new_lr != old_lr )
+  {
+    cfg->learning_rate = new_lr;
+    cfg->is_dirty = true;
+  }
+
+  /* ── SGD momentum (only shown when SGD is selected) ── */
+  if ( cfg->optimizer == CONFIG_OPTIMIZER_SGD )
+  {
+    nk_layout_row_dynamic( app->nk, 24, 1 );
+    nk_labelf( app->nk, NK_TEXT_LEFT, "SGD momentum: %.3f", cfg->sgd_momentum );
+
+    nk_layout_row_dynamic( app->nk, 24, 1 );
+    float old_mom = cfg->sgd_momentum;
+    float new_mom = old_mom;
+    nk_slider_float( app->nk, 0.0f, &new_mom, 0.999f, 0.001f );
+    if ( new_mom != old_mom )
+    {
+      cfg->sgd_momentum = new_mom;
+      cfg->is_dirty = true;
+    }
+  }
+
+  /* ── Architecture summary ── */
+  nk_layout_row_dynamic( app->nk, 8, 1 );
+  nk_label( app->nk, "", NK_TEXT_LEFT );
+
+  char summary[256];
+  network_config_summary( cfg, summary, sizeof( summary ) );
+  nk_layout_row_dynamic( app->nk, 24, 1 );
+  nk_labelf( app->nk, NK_TEXT_LEFT, "Architecture: %s", summary );
+
+  /* ── Status + Apply button ── */
+  nk_layout_row_dynamic( app->nk, 24, 1 );
+  if ( cfg->is_applied && !cfg->is_dirty ) nk_label_colored( app->nk, "Status: Applied and ready to train", NK_TEXT_LEFT, nk_rgb( 60, 160, 60 ) );
+  else if ( cfg->is_dirty && cfg->is_applied )
+    nk_label_colored( app->nk, "Status: Modified since last Apply -- press Apply to rebuild", NK_TEXT_LEFT, nk_rgb( 220, 150, 40 ) );
+  else nk_label_colored( app->nk, "Status: Not applied yet", NK_TEXT_LEFT, nk_rgb( 220, 60, 60 ) );
+
+  nk_layout_row_dynamic( app->nk, 40, 1 );
+  nk_widget_disable_begin( app->nk );
+  if ( training_active )
+  {
+    /* visually disabled — Nuklear doesn't have true widget-disable
+       without the extended API, so we just block the action inline */
+  }
+  if ( nk_button_label( app->nk, "Apply Configuration" ) && !training_active ) { apply_network_config( app ); }
+  nk_widget_disable_end( app->nk );
+
+  nk_end( app->nk );
 }

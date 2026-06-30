@@ -190,7 +190,7 @@ void optimizer_step( _optimizer_t *opt, _network_t *network )
 
     if ( !l->weights && !l->bias )
     {
-      /* Activation layers (ReLU, Sigmoid) — no parameters to update */
+      /* Activation layers (ReLU, Sigmoid) - no parameters to update */
       node = node->next;
       continue;
     }
