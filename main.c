@@ -4,9 +4,11 @@
 #include <SDL3/SDL_surface.h>
 #include <SDL3/SDL_video.h>
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define NK_INCLUDE_STANDARD_VARARGS
 #define NK_INCLUDE_STANDARD_IO
@@ -29,10 +31,11 @@
 #include "tensor.h"
 #include "training.h"
 
-/* ── Constants ───────────────────────────────────────────────────────── */
-#define WINDOW_W 1300
-#define WINDOW_H 820
+/* Constants */
+#define WINDOW_W 1600
+#define WINDOW_H 860
 #define IMG_NATIVE_SIZE 28
+#define NUM_CLASSES 10
 
 #define TRAIN_IMG_PATH "../datasets/train-images.idx3-ubyte"
 #define TRAIN_LBL_PATH "../datasets/train-labels.idx1-ubyte"
@@ -43,48 +46,99 @@
 #define BG_G 245
 #define BG_B 240
 
-/* ── App state ───────────────────────────────────────────────────────── */
+/* UI tabs */
+typedef enum
+{
+  TAB_VIEWER = 0,
+  TAB_TRAINING,
+  TAB_TESTING
+} _app_tab_t;
+
+/* Test result for a single image */
+typedef struct
+{
+  bool has_result;
+  int true_label;
+  int predicted_label;
+  float probabilities[NUM_CLASSES];
+  bool is_correct;
+} _test_result_t;
+
+/* Full-dataset evaluation state */
+typedef struct
+{
+  bool is_running;
+  int total;
+  int done;
+  int correct;
+  float accuracy;
+  SDL_Thread *thread;
+} _eval_state_t;
+
+/* App state  */
 typedef struct
 {
   SDL_Window *window;
   SDL_Renderer *renderer;
   bool is_running;
 
-  /* Dataset viewer */
+  /* Arenas */
   _ds_arena_t_ arena;
   _ds_arena_t_ scratch_arena;
+  _ds_arena_t_ infer_arena;
+  _ds_arena_t_ weight_arena;
+
+  /* Datasets */
   __dataset__ *train_ds;
   __dataset__ *test_ds;
+
+  /* Viewer */
   uint32_t current_index;
   _tensor_t *current_image;
   uint32_t current_label;
   SDL_Texture *mnist_texture;
   struct nk_image nk_mnist_image;
 
-  /* Network + training */
-  _ds_arena_t_ weight_arena;
+  /* Network */
   _network_t *network;
   _optimizer_t *optimizer;
+
+  /* Training */
   _training_state_t *training_state;
   _training_ctx_t *training_ctx;
   SDL_Thread *training_thread;
-  _training_metrics_t metrics; /* snapshot updated every frame */
+  _training_metrics_t metrics;
 
-  /* Nuklear */
+  /* Testing */
+  int test_index;
+  _test_result_t test_result;
+  SDL_Texture *test_texture;
+  struct nk_image nk_test_image;
+  _eval_state_t eval;
+  SDL_Mutex *eval_mutex;
+
+  /* UI */
+  _app_tab_t active_tab;
   struct nk_context *nk;
   struct nk_font *mono_font;
   struct nk_font *ui_font;
 } App;
 
-/* ── Helpers ──────────────────────────────────────────────────────────── */
+/* Forward declarations */
 static void apply_white_theme( struct nk_context *nk );
-static bool navigate( App *app, int delta );
-static SDL_Texture *create_mnist_texture( SDL_Renderer *renderer, const _tensor_t *image );
+static bool navigate_viewer( App *app, int delta );
+static bool navigate_test( App *app, int delta );
+static SDL_Texture *tensor_to_texture( SDL_Renderer *r, const _tensor_t *img );
 static void build_network( App *app );
+static void run_inference( App *app, int idx );
+static void render_tab_bar( App *app, float w );
 static void render_viewer_panel( App *app, float x, float y, float w, float h );
 static void render_training_panel( App *app, float x, float y, float w, float h );
+static void render_testing_panel( App *app, float x, float y, float w, float h );
 
-/* ── Entry point ──────────────────────────────────────────────────────── */
+/* ════════════════════════════════════════════════════════════════════════
+ * Entry point
+ * ════════════════════════════════════════════════════════════════════════ */
 int main( void )
 {
   if ( !SDL_Init( SDL_INIT_VIDEO ) )
@@ -93,7 +147,11 @@ int main( void )
     return SDL_APP_FAILURE;
   }
 
-  App app = { .is_running = true, .current_index = 0 };
+  App app;
+  memset( &app, 0, sizeof( App ) );
+  app.is_running = true;
+  app.active_tab = TAB_VIEWER;
+  app.test_index = 0;
 
   if ( !SDL_CreateWindowAndRenderer( "Hand Written Digit Recognizer (HWDR)", WINDOW_W, WINDOW_H, SDL_WINDOW_RESIZABLE, &app.window, &app.renderer ) )
   {
@@ -102,33 +160,29 @@ int main( void )
     return SDL_APP_FAILURE;
   }
 
-  /* ── Arenas ── */
   app.arena = ds_arena_new( 0 );
   app.scratch_arena = ds_arena_new( 0 );
+  app.infer_arena = ds_arena_new( 0 );
   app.weight_arena = ds_arena_new( 0 );
 
-  /* ── Datasets ── */
   app.train_ds = dataset_init( &app.arena, TRAIN_IMG_PATH, TRAIN_LBL_PATH );
   app.test_ds = dataset_init( &app.arena, TEST_IMG_PATH, TEST_LBL_PATH );
-  if ( !app.train_ds )
+  if ( !app.train_ds || !app.test_ds )
   {
-    SDL_LogError( SDL_LOG_CATEGORY_ERROR, "Failed to load training dataset" );
+    SDL_LogError( SDL_LOG_CATEGORY_ERROR, "Failed to open datasets" );
     return SDL_APP_FAILURE;
   }
 
-  if ( !navigate( &app, 0 ) )
+  if ( !navigate_viewer( &app, 0 ) )
   {
     SDL_LogError( SDL_LOG_CATEGORY_ERROR, "Failed to load first image" );
     return SDL_APP_FAILURE;
   }
 
-  /* ── Build network + optimizer ── */
   build_network( &app );
-
-  /* ── Training state ── */
   app.training_state = training_state_create( &app.arena );
+  app.eval_mutex = SDL_CreateMutex();
 
-  /* ── Nuklear ── */
   app.nk = nk_sdl_init( app.window, app.renderer, nk_sdl_allocator() );
   {
     struct nk_font_atlas *atlas = nk_sdl_font_stash_begin( app.nk );
@@ -140,7 +194,6 @@ int main( void )
   }
   apply_white_theme( app.nk );
 
-  /* ── Main loop ── */
   SDL_Event event;
   nk_input_begin( app.nk );
 
@@ -158,16 +211,20 @@ int main( void )
           app.is_running = false;
           break;
         case SDLK_RIGHT:
-          navigate( &app, +1 );
+          if ( app.active_tab == TAB_VIEWER ) navigate_viewer( &app, +1 );
+          if ( app.active_tab == TAB_TESTING ) navigate_test( &app, +1 );
           break;
         case SDLK_LEFT:
-          navigate( &app, -1 );
+          if ( app.active_tab == TAB_VIEWER ) navigate_viewer( &app, -1 );
+          if ( app.active_tab == TAB_TESTING ) navigate_test( &app, -1 );
           break;
         case SDLK_PAGEDOWN:
-          navigate( &app, +100 );
+          if ( app.active_tab == TAB_VIEWER ) navigate_viewer( &app, +100 );
+          if ( app.active_tab == TAB_TESTING ) navigate_test( &app, +100 );
           break;
         case SDLK_PAGEUP:
-          navigate( &app, -100 );
+          if ( app.active_tab == TAB_VIEWER ) navigate_viewer( &app, -100 );
+          if ( app.active_tab == TAB_TESTING ) navigate_test( &app, -100 );
           break;
         }
       }
@@ -177,20 +234,33 @@ int main( void )
     }
     nk_input_end( app.nk );
 
-    /* Snapshot metrics every frame (short lock) */
     training_read_metrics( app.training_state, &app.metrics );
 
-    /* ── Layout: left = viewer, right = training ── */
     int win_w, win_h;
     SDL_GetWindowSize( app.window, &win_w, &win_h );
 
-    float left_w = (float)win_w * 0.45f;
-    float right_w = (float)win_w - left_w;
+    float tab_h = 44.0f;
+    float content_y = tab_h;
+    float content_h = (float)win_h - tab_h;
 
-    render_viewer_panel( &app, 0, 0, left_w, (float)win_h );
-    render_training_panel( &app, left_w, 0, right_w, (float)win_h );
+    render_tab_bar( &app, (float)win_w );
 
-    /* ── Render ── */
+    switch ( app.active_tab )
+    {
+    case TAB_VIEWER: {
+      float lw = (float)win_w * 0.45f;
+      render_viewer_panel( &app, 0, content_y, lw, content_h );
+      render_training_panel( &app, lw, content_y, (float)win_w - lw, content_h );
+      break;
+    }
+    case TAB_TRAINING:
+      render_training_panel( &app, 0, content_y, (float)win_w, content_h );
+      break;
+    case TAB_TESTING:
+      render_testing_panel( &app, 0, content_y, (float)win_w, content_h );
+      break;
+    }
+
     SDL_SetRenderDrawColor( app.renderer, BG_R, BG_G, BG_B, 255 );
     SDL_RenderClear( app.renderer );
     nk_sdl_render( app.nk, NK_ANTI_ALIASING_ON );
@@ -200,12 +270,23 @@ int main( void )
     nk_input_begin( app.nk );
   }
 
-  /* ── Cleanup ── */
+  /* Cleanup */
   if ( app.training_thread ) training_stop( app.training_thread, app.training_state );
 
+  if ( app.eval.thread )
+  {
+    SDL_LockMutex( app.eval_mutex );
+    app.eval.is_running = false;
+    SDL_UnlockMutex( app.eval_mutex );
+    SDL_WaitThread( app.eval.thread, NULL );
+  }
+
   training_state_destroy( app.training_state );
+  SDL_DestroyMutex( app.eval_mutex );
 
   if ( app.mnist_texture ) SDL_DestroyTexture( app.mnist_texture );
+  if ( app.test_texture ) SDL_DestroyTexture( app.test_texture );
+
   nk_input_end( app.nk );
   nk_sdl_shutdown( app.nk );
   SDL_DestroyRenderer( app.renderer );
@@ -214,6 +295,7 @@ int main( void )
   if ( app.train_ds ) dataset_close( app.train_ds );
   if ( app.test_ds ) dataset_close( app.test_ds );
 
+  ds_arena_destroy( &app.infer_arena );
   ds_arena_destroy( &app.scratch_arena );
   ds_arena_destroy( &app.weight_arena );
   ds_arena_destroy( &app.arena );
@@ -221,9 +303,9 @@ int main( void )
   return SDL_APP_SUCCESS;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- * build_network
- * ══════════════════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════════════════
+ * Network
+ * ════════════════════════════════════════════════════════════════════════ */
 static void build_network( App *app )
 {
   app->network = network_create( &app->weight_arena );
@@ -236,9 +318,226 @@ static void build_network( App *app )
   app->optimizer = optimizer_create_adam( &app->weight_arena, app->network, optimizer_adam_defaults() );
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- * Viewer panel (left)
- * ══════════════════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════════════════
+ * Inference
+ * ════════════════════════════════════════════════════════════════════════ */
+static void softmax_inplace( float *logits, float *probs, int n )
+{
+  float mx = logits[0];
+  for ( int i = 1; i < n; i++ )
+    if ( logits[i] > mx ) mx = logits[i];
+  float s = 0.0f;
+  for ( int i = 0; i < n; i++ )
+  {
+    probs[i] = expf( logits[i] - mx );
+    s += probs[i];
+  }
+  for ( int i = 0; i < n; i++ ) probs[i] /= s;
+}
+
+static void run_inference( App *app, int idx )
+{
+  _ds_arena_checkpoint_t_ cp = ds_arena_checkpoint( &app->infer_arena );
+
+  _tensor_t *img = load_image( &app->infer_arena, app->test_ds, idx );
+  _tensor_t *lbl = load_label( &app->infer_arena, app->test_ds, idx );
+  if ( !img || !lbl )
+  {
+    ds_arena_reset_to( &app->infer_arena, cp );
+    return;
+  }
+
+  if ( app->test_texture ) SDL_DestroyTexture( app->test_texture );
+  app->test_texture = tensor_to_texture( app->renderer, img );
+  app->nk_test_image = nk_image_ptr( app->test_texture );
+
+  int flat_shape[] = { 1, IMG_NATIVE_SIZE * IMG_NATIVE_SIZE };
+  _tensor_t *input = tensor_zeros( &app->infer_arena, 2, flat_shape );
+  if ( !input )
+  {
+    ds_arena_reset_to( &app->infer_arena, cp );
+    return;
+  }
+  memcpy( input->data, img->data, (size_t)( IMG_NATIVE_SIZE * IMG_NATIVE_SIZE ) * sizeof( float ) );
+
+  _tensor_t *logits = app->network->forward( app->network, &app->infer_arena, input );
+  if ( !logits )
+  {
+    ds_arena_reset_to( &app->infer_arena, cp );
+    return;
+  }
+
+  _test_result_t *r = &app->test_result;
+  r->true_label = (int)lbl->data[0];
+  softmax_inplace( logits->data, r->probabilities, NUM_CLASSES );
+
+  r->predicted_label = 0;
+  float best = r->probabilities[0];
+  for ( int j = 1; j < NUM_CLASSES; j++ )
+    if ( r->probabilities[j] > best )
+    {
+      best = r->probabilities[j];
+      r->predicted_label = j;
+    }
+
+  r->is_correct = ( r->predicted_label == r->true_label );
+  r->has_result = true;
+
+  ds_arena_reset_to( &app->infer_arena, cp );
+}
+
+/* Full-dataset evaluation thread */
+typedef struct
+{
+  App *app;
+} _eval_arg_t;
+
+static int eval_thread_fn( void *ud )
+{
+  App *app = ( (_eval_arg_t *)ud )->app;
+  int total = (int)app->test_ds->image_header.count;
+  _ds_arena_t_ ea = ds_arena_new( 0 );
+
+  SDL_LockMutex( app->eval_mutex );
+  app->eval.total = total;
+  app->eval.done = 0;
+  app->eval.correct = 0;
+  app->eval.accuracy = 0.0f;
+  SDL_UnlockMutex( app->eval_mutex );
+
+  for ( int i = 0; i < total; i++ )
+  {
+    SDL_LockMutex( app->eval_mutex );
+    bool stop = !app->eval.is_running;
+    SDL_UnlockMutex( app->eval_mutex );
+    if ( stop ) break;
+
+    _ds_arena_checkpoint_t_ cp = ds_arena_checkpoint( &ea );
+
+    _tensor_t *img = load_image( &ea, app->test_ds, i );
+    _tensor_t *lbl = load_label( &ea, app->test_ds, i );
+    if ( !img || !lbl )
+    {
+      ds_arena_reset_to( &ea, cp );
+      continue;
+    }
+
+    int shape[] = { 1, IMG_NATIVE_SIZE * IMG_NATIVE_SIZE };
+    _tensor_t *inp = tensor_zeros( &ea, 2, shape );
+    if ( !inp )
+    {
+      ds_arena_reset_to( &ea, cp );
+      continue;
+    }
+    memcpy( inp->data, img->data, (size_t)( IMG_NATIVE_SIZE * IMG_NATIVE_SIZE ) * sizeof( float ) );
+
+    _tensor_t *logits = app->network->forward( app->network, &ea, inp );
+    if ( !logits )
+    {
+      ds_arena_reset_to( &ea, cp );
+      continue;
+    }
+
+    int pred = 0;
+    float bv = logits->data[0];
+    for ( int j = 1; j < NUM_CLASSES; j++ )
+      if ( logits->data[j] > bv )
+      {
+        bv = logits->data[j];
+        pred = j;
+      }
+
+    int correct = ( pred == (int)lbl->data[0] ) ? 1 : 0;
+
+    SDL_LockMutex( app->eval_mutex );
+    app->eval.done++;
+    app->eval.correct += correct;
+    app->eval.accuracy = (float)app->eval.correct / (float)app->eval.done;
+    SDL_UnlockMutex( app->eval_mutex );
+
+    ds_arena_reset_to( &ea, cp );
+  }
+
+  SDL_LockMutex( app->eval_mutex );
+  app->eval.is_running = false;
+  SDL_UnlockMutex( app->eval_mutex );
+
+  ds_arena_destroy( &ea );
+  return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Navigation
+ * ════════════════════════════════════════════════════════════════════════ */
+static SDL_Texture *tensor_to_texture( SDL_Renderer *r, const _tensor_t *img )
+{
+  uint8_t rgba[IMG_NATIVE_SIZE * IMG_NATIVE_SIZE * 4];
+  for ( int i = 0; i < IMG_NATIVE_SIZE * IMG_NATIVE_SIZE; i++ )
+  {
+    uint8_t v = (uint8_t)( img->data[i] * 255.0f + 0.5f );
+    rgba[i * 4 + 0] = v;
+    rgba[i * 4 + 1] = v;
+    rgba[i * 4 + 2] = v;
+    rgba[i * 4 + 3] = 255;
+  }
+  SDL_Texture *tex = SDL_CreateTexture( r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STATIC, IMG_NATIVE_SIZE, IMG_NATIVE_SIZE );
+  if ( !tex ) return NULL;
+  SDL_SetTextureScaleMode( tex, SDL_SCALEMODE_NEAREST );
+  SDL_UpdateTexture( tex, NULL, rgba, IMG_NATIVE_SIZE * 4 );
+  return tex;
+}
+
+static bool navigate_viewer( App *app, int delta )
+{
+  uint32_t count = app->train_ds->image_header.count;
+  app->current_index = ( app->current_index + count + (uint32_t)delta ) % count;
+
+  _ds_arena_t_ ns = ds_arena_new( 0 );
+  _tensor_t *img = load_image( &ns, app->train_ds, (int)app->current_index );
+  _tensor_t *lbl = load_label( &ns, app->train_ds, (int)app->current_index );
+  if ( !img || !lbl )
+  {
+    ds_arena_destroy( &ns );
+    return false;
+  }
+
+  ds_arena_destroy( &app->scratch_arena );
+  app->scratch_arena = ns;
+  app->current_image = img;
+  app->current_label = (uint32_t)lbl->data[0];
+
+  if ( app->mnist_texture ) SDL_DestroyTexture( app->mnist_texture );
+  app->mnist_texture = tensor_to_texture( app->renderer, img );
+  app->nk_mnist_image = nk_image_ptr( app->mnist_texture );
+  return true;
+}
+
+static bool navigate_test( App *app, int delta )
+{
+  int count = (int)app->test_ds->image_header.count;
+  app->test_index = ( app->test_index + count + delta ) % count;
+  run_inference( app, app->test_index );
+  return true;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Tab bar
+ * ════════════════════════════════════════════════════════════════════════ */
+static void render_tab_bar( App *app, float w )
+{
+  if ( nk_begin( app->nk, "tabs", nk_rect( 0, 0, w, 44 ), NK_WINDOW_NO_SCROLLBAR ) )
+  {
+    nk_layout_row_static( app->nk, 36, (int)( w / 3 ) - 4, 3 );
+    if ( nk_button_label( app->nk, "Viewer + Training" ) ) app->active_tab = TAB_VIEWER;
+    if ( nk_button_label( app->nk, "Training" ) ) app->active_tab = TAB_TRAINING;
+    if ( nk_button_label( app->nk, "Testing" ) ) app->active_tab = TAB_TESTING;
+  }
+  nk_end( app->nk );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Viewer panel
+ * ════════════════════════════════════════════════════════════════════════ */
 static void render_viewer_panel( App *app, float x, float y, float w, float h )
 {
   if ( !nk_begin( app->nk, "viewer", nk_rect( x, y, w, h ), NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR ) )
@@ -249,34 +548,32 @@ static void render_viewer_panel( App *app, float x, float y, float w, float h )
 
   uint32_t total = app->train_ds->image_header.count;
 
-  nk_layout_row_dynamic( app->nk, 30, 1 );
+  nk_layout_row_dynamic( app->nk, 28, 1 );
   nk_labelf( app->nk, NK_TEXT_CENTERED, "Image %u / %u     Label: %u", app->current_index + 1, total, app->current_label );
 
-  nk_layout_row_dynamic( app->nk, 35, 2 );
-  if ( nk_button_label( app->nk, "<  Prev" ) ) navigate( app, -1 );
-  if ( nk_button_label( app->nk, "Next  >" ) ) navigate( app, +1 );
+  nk_layout_row_dynamic( app->nk, 32, 2 );
+  if ( nk_button_label( app->nk, "<  Prev" ) ) navigate_viewer( app, -1 );
+  if ( nk_button_label( app->nk, "Next  >" ) ) navigate_viewer( app, +1 );
 
-  float content_h = h - 110.0f;
-  if ( content_h < 80.0f ) content_h = 80.0f;
+  float ch = h - 100.0f;
+  if ( ch < 80.0f ) ch = 80.0f;
 
-  nk_layout_row_begin( app->nk, NK_DYNAMIC, content_h, 2 );
+  nk_layout_row_begin( app->nk, NK_DYNAMIC, ch, 2 );
 
-  /* Image panel — black background */
-  struct nk_style_item orig_bg = app->nk->style.window.fixed_background;
+  struct nk_style_item orig = app->nk->style.window.fixed_background;
   app->nk->style.window.fixed_background = nk_style_item_color( nk_rgb( 0, 0, 0 ) );
 
   nk_layout_row_push( app->nk, 0.42f );
-  if ( nk_group_begin( app->nk, "img_panel", NK_WINDOW_BORDER | NK_WINDOW_TITLE ) )
+  if ( nk_group_begin( app->nk, "img_g", NK_WINDOW_BORDER | NK_WINDOW_TITLE ) )
   {
-    nk_layout_row_dynamic( app->nk, content_h - 38.0f, 1 );
+    nk_layout_row_dynamic( app->nk, ch - 38.0f, 1 );
     nk_image( app->nk, app->nk_mnist_image );
     nk_group_end( app->nk );
   }
-  app->nk->style.window.fixed_background = orig_bg;
+  app->nk->style.window.fixed_background = orig;
 
-  /* Pixel grid panel */
   nk_layout_row_push( app->nk, 0.58f );
-  if ( nk_group_begin( app->nk, "pix_panel", NK_WINDOW_BORDER | NK_WINDOW_TITLE ) )
+  if ( nk_group_begin( app->nk, "pix_g", NK_WINDOW_BORDER | NK_WINDOW_TITLE ) )
   {
     nk_style_set_font( app->nk, &app->mono_font->handle );
     uint32_t rows = app->train_ds->rows;
@@ -285,7 +582,7 @@ static void render_viewer_panel( App *app, float x, float y, float w, float h )
 
     for ( uint32_t r = 0; r < rows; r++ )
     {
-      nk_layout_row_static( app->nk, 18, 20, (int)cols );
+      nk_layout_row_static( app->nk, 16, 18, (int)cols );
       for ( uint32_t c = 0; c < cols; c++ )
       {
         uint8_t v = (uint8_t)( img->data[r * cols + c] * 255.0f + 0.5f );
@@ -297,14 +594,13 @@ static void render_viewer_panel( App *app, float x, float y, float w, float h )
     nk_style_set_font( app->nk, &app->ui_font->handle );
     nk_group_end( app->nk );
   }
-
   nk_layout_row_end( app->nk );
   nk_end( app->nk );
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- * Training panel (right)
- * ══════════════════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════════════════
+ * Training panel
+ * ════════════════════════════════════════════════════════════════════════ */
 static void render_training_panel( App *app, float x, float y, float w, float h )
 {
   _training_metrics_t *m = &app->metrics;
@@ -315,18 +611,14 @@ static void render_training_panel( App *app, float x, float y, float w, float h 
     return;
   }
 
-  /* ── Network info ── */
-  nk_layout_row_dynamic( app->nk, 24, 1 );
-  nk_label( app->nk, "Network: 784 → 128 → 64 → 10  (Adam lr=1e-3)", NK_TEXT_LEFT );
+  nk_layout_row_dynamic( app->nk, 22, 1 );
+  nk_label( app->nk, "Network: 784 -> 128 -> 64 -> 10  (Adam lr=1e-3)", NK_TEXT_LEFT );
 
-  /* ── Control buttons ── */
-  nk_layout_row_dynamic( app->nk, 38, 3 );
-
+  nk_layout_row_dynamic( app->nk, 36, 3 );
   if ( !m->is_training )
   {
     if ( nk_button_label( app->nk, "Start Training" ) )
     {
-      /* Build ctx on the persistent arena so it outlives this frame */
       app->training_ctx = ARENA_NEW( &app->weight_arena, _training_ctx_t );
       app->training_ctx->state = app->training_state;
       app->training_ctx->network = app->network;
@@ -338,6 +630,8 @@ static void render_training_panel( App *app, float x, float y, float w, float h 
       app->training_ctx->batch_arena = ds_arena_new( 0 );
       app->training_thread = training_start( app->training_ctx );
     }
+    nk_label( app->nk, "", NK_TEXT_LEFT );
+    nk_label( app->nk, "", NK_TEXT_LEFT );
   }
   else
   {
@@ -346,129 +640,243 @@ static void render_training_panel( App *app, float x, float y, float w, float h 
       training_stop( app->training_thread, app->training_state );
       app->training_thread = NULL;
     }
-
-    const char *pause_label = m->is_paused ? "Resume" : "Pause";
-    if ( nk_button_label( app->nk, pause_label ) )
+    const char *pl = m->is_paused ? "Resume" : "Pause";
+    if ( nk_button_label( app->nk, pl ) )
     {
       SDL_LockMutex( app->training_state->mutex );
       app->training_state->is_paused = !app->training_state->is_paused;
       SDL_UnlockMutex( app->training_state->mutex );
     }
-
-    nk_label( app->nk, "", NK_TEXT_LEFT ); /* spacer */
+    nk_label( app->nk, "", NK_TEXT_LEFT );
   }
 
-  /* ── Progress ── */
-  nk_layout_row_dynamic( app->nk, 24, 1 );
+  nk_layout_row_dynamic( app->nk, 22, 1 );
   if ( m->is_training )
   {
     nk_labelf( app->nk, NK_TEXT_LEFT, "Epoch %d / %d    Batch %d / %d", m->epoch, m->total_epochs, m->batch, m->total_batches );
     nk_labelf( app->nk, NK_TEXT_LEFT, "Epoch loss: %.4f    Epoch acc: %.2f%%", m->epoch_loss, m->epoch_acc * 100.0f );
-
-    /* Epoch progress bar */
-    float epoch_prog = m->total_batches > 0 ? (float)m->batch / (float)m->total_batches : 0.0f;
-    nk_layout_row_dynamic( app->nk, 18, 1 );
-    nk_progress( app->nk, (nk_size *)&( nk_size ){ (nk_size)( epoch_prog * 100 ) }, 100, NK_FIXED );
+    nk_layout_row_dynamic( app->nk, 16, 1 );
+    float prog = m->total_batches > 0 ? (float)m->batch / (float)m->total_batches : 0.0f;
+    nk_size pv = (nk_size)( prog * 100.0f );
+    nk_progress( app->nk, &pv, 100, NK_FIXED );
   }
   else
   {
     nk_label( app->nk, "Not training", NK_TEXT_LEFT );
-    nk_layout_row_dynamic( app->nk, 18, 1 );
+    nk_layout_row_dynamic( app->nk, 16, 1 );
+    nk_label( app->nk, "", NK_TEXT_LEFT );
     nk_label( app->nk, "", NK_TEXT_LEFT );
   }
 
-  /* ── Loss curve ── */
-  float chart_h = ( h - 240.0f ) * 0.5f;
-  if ( chart_h < 80.0f ) chart_h = 80.0f;
+  float chart_h = ( h - 260.0f ) * 0.5f;
+  if ( chart_h < 70.0f ) chart_h = 70.0f;
 
-  nk_layout_row_dynamic( app->nk, 20, 1 );
+  nk_layout_row_dynamic( app->nk, 18, 1 );
   nk_label( app->nk, "Loss (per batch)", NK_TEXT_LEFT );
-
   nk_layout_row_dynamic( app->nk, chart_h, 1 );
   if ( m->history_count > 1 && nk_chart_begin( app->nk, NK_CHART_LINES, m->history_count, 0.0f, 5.0f ) )
   {
     int start = m->history_count >= TRAINING_HISTORY_CAP ? m->history_head : 0;
     int n = m->history_count >= TRAINING_HISTORY_CAP ? TRAINING_HISTORY_CAP : m->history_count;
-
-    for ( int i = 0; i < n; i++ )
-    {
-      int idx = ( start + i ) % TRAINING_HISTORY_CAP;
-      nk_chart_push( app->nk, m->loss_history[idx] );
-    }
+    for ( int i = 0; i < n; i++ ) nk_chart_push( app->nk, m->loss_history[( start + i ) % TRAINING_HISTORY_CAP] );
     nk_chart_end( app->nk );
   }
 
-  /* ── Accuracy curve ── */
-  nk_layout_row_dynamic( app->nk, 20, 1 );
+  nk_layout_row_dynamic( app->nk, 18, 1 );
   nk_label( app->nk, "Accuracy (per epoch)", NK_TEXT_LEFT );
-
   nk_layout_row_dynamic( app->nk, chart_h, 1 );
   if ( m->history_count > 1 && nk_chart_begin( app->nk, NK_CHART_LINES, m->history_count, 0.0f, 1.0f ) )
   {
     int start = m->history_count >= TRAINING_HISTORY_CAP ? m->history_head : 0;
     int n = m->history_count >= TRAINING_HISTORY_CAP ? TRAINING_HISTORY_CAP : m->history_count;
-
-    for ( int i = 0; i < n; i++ )
-    {
-      int idx = ( start + i ) % TRAINING_HISTORY_CAP;
-      nk_chart_push( app->nk, m->acc_history[idx] );
-    }
+    for ( int i = 0; i < n; i++ ) nk_chart_push( app->nk, m->acc_history[( start + i ) % TRAINING_HISTORY_CAP] );
     nk_chart_end( app->nk );
   }
 
   nk_end( app->nk );
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- * Helpers
- * ══════════════════════════════════════════════════════════════════════════ */
-static SDL_Texture *create_mnist_texture( SDL_Renderer *renderer, const _tensor_t *image )
+/* ════════════════════════════════════════════════════════════════════════
+ * Testing panel
+ * ════════════════════════════════════════════════════════════════════════ */
+static void render_testing_panel( App *app, float x, float y, float w, float h )
 {
-  uint32_t rows = (uint32_t)image->shape[1];
-  uint32_t cols = (uint32_t)image->shape[2];
-
-  uint8_t rgba[IMG_NATIVE_SIZE * IMG_NATIVE_SIZE * 4];
-  for ( uint32_t i = 0; i < rows * cols; i++ )
+  if ( !nk_begin( app->nk, "testing", nk_rect( x, y, w, h ), NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR ) )
   {
-    uint8_t v = (uint8_t)( image->data[i] * 255.0f + 0.5f );
-    rgba[i * 4 + 0] = v;
-    rgba[i * 4 + 1] = v;
-    rgba[i * 4 + 2] = v;
-    rgba[i * 4 + 3] = 255;
+    nk_end( app->nk );
+    return;
   }
 
-  SDL_Texture *tex = SDL_CreateTexture( renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STATIC, (int)cols, (int)rows );
-  if ( !tex ) return NULL;
-  SDL_SetTextureScaleMode( tex, SDL_SCALEMODE_NEAREST );
-  SDL_UpdateTexture( tex, NULL, rgba, (int)cols * 4 );
-  return tex;
-}
+  uint32_t test_count = app->test_ds->image_header.count;
 
-static bool navigate( App *app, int delta )
-{
-  uint32_t count = app->train_ds->image_header.count;
-  app->current_index = ( app->current_index + count + (uint32_t)delta ) % count;
+  /* Top controls */
+  nk_layout_row_dynamic( app->nk, 32, 5 );
+  if ( nk_button_label( app->nk, "<  Prev" ) ) navigate_test( app, -1 );
+  nk_labelf( app->nk, NK_TEXT_CENTERED, "%d / %u", app->test_index + 1, test_count );
+  if ( nk_button_label( app->nk, "Next  >" ) ) navigate_test( app, +1 );
+  if ( nk_button_label( app->nk, "Run Inference" ) ) run_inference( app, app->test_index );
 
-  _ds_arena_t_ new_scratch = ds_arena_new( 0 );
-  _tensor_t *image = load_image( &new_scratch, app->train_ds, (int)app->current_index );
-  _tensor_t *label = load_label( &new_scratch, app->train_ds, (int)app->current_index );
-  if ( !image || !label )
+  /* Full-eval button */
+  SDL_LockMutex( app->eval_mutex );
+  bool eval_running = app->eval.is_running;
+  SDL_UnlockMutex( app->eval_mutex );
+
+  if ( !eval_running )
   {
-    ds_arena_destroy( &new_scratch );
-    return false;
+    if ( nk_button_label( app->nk, "Eval All (10k)" ) )
+    {
+      if ( app->eval.thread )
+      {
+        SDL_LockMutex( app->eval_mutex );
+        app->eval.is_running = false;
+        SDL_UnlockMutex( app->eval_mutex );
+        SDL_WaitThread( app->eval.thread, NULL );
+        app->eval.thread = NULL;
+      }
+      SDL_LockMutex( app->eval_mutex );
+      app->eval.is_running = true;
+      SDL_UnlockMutex( app->eval_mutex );
+      _eval_arg_t *arg = ARENA_NEW( &app->arena, _eval_arg_t );
+      arg->app = app;
+      app->eval.thread = SDL_CreateThread( eval_thread_fn, "eval", arg );
+    }
+  }
+  else
+  {
+    if ( nk_button_label( app->nk, "Stop Eval" ) )
+    {
+      SDL_LockMutex( app->eval_mutex );
+      app->eval.is_running = false;
+      SDL_UnlockMutex( app->eval_mutex );
+    }
   }
 
-  ds_arena_destroy( &app->scratch_arena );
-  app->scratch_arena = new_scratch;
-  app->current_image = image;
-  app->current_label = (uint32_t)label->data[0];
+  /* Full-eval progress bar */
+  SDL_LockMutex( app->eval_mutex );
+  int eval_done = app->eval.done;
+  int eval_total = app->eval.total;
+  int eval_correct = app->eval.correct;
+  float eval_acc = app->eval.accuracy;
+  bool eval_still = app->eval.is_running;
+  SDL_UnlockMutex( app->eval_mutex );
 
-  if ( app->mnist_texture ) SDL_DestroyTexture( app->mnist_texture );
-  app->mnist_texture = create_mnist_texture( app->renderer, image );
-  app->nk_mnist_image = nk_image_ptr( app->mnist_texture );
-  return true;
+  nk_layout_row_dynamic( app->nk, 22, 1 );
+  if ( eval_total > 0 )
+  {
+    nk_labelf( app->nk, NK_TEXT_LEFT, "Full eval: %d / %d   Correct: %d   Accuracy: %.2f%%  %s", eval_done, eval_total, eval_correct,
+               eval_acc * 100.0f, eval_still ? "(running...)" : "(done)" );
+  }
+  else { nk_label( app->nk, "Press 'Eval All' to evaluate accuracy on the full 10k test set.", NK_TEXT_LEFT ); }
+
+  nk_layout_row_dynamic( app->nk, 14, 1 );
+  if ( eval_total > 0 )
+  {
+    nk_size pv = (nk_size)( eval_total > 0 ? (float)eval_done / (float)eval_total * 100.0f : 0.0f );
+    nk_progress( app->nk, &pv, 100, NK_FIXED );
+  }
+  else { nk_label( app->nk, "", NK_TEXT_LEFT ); }
+
+  /* Main content */
+  float ch = h - 130.0f;
+  if ( ch < 80.0f ) ch = 80.0f;
+
+  nk_layout_row_begin( app->nk, NK_DYNAMIC, ch, 2 );
+
+  /* LEFT: test image */
+  nk_layout_row_push( app->nk, 0.25f );
+
+  struct nk_style_item orig = app->nk->style.window.fixed_background;
+  app->nk->style.window.fixed_background = nk_style_item_color( nk_rgb( 0, 0, 0 ) );
+  if ( nk_group_begin( app->nk, "timg_g", NK_WINDOW_BORDER | NK_WINDOW_TITLE ) )
+  {
+    if ( app->test_result.has_result && app->test_texture )
+    {
+      nk_layout_row_dynamic( app->nk, ch - 40.0f, 1 );
+      nk_image( app->nk, app->nk_test_image );
+    }
+    else
+    {
+      nk_layout_row_dynamic( app->nk, 26, 1 );
+      nk_label( app->nk, "No image yet", NK_TEXT_CENTERED );
+    }
+    nk_group_end( app->nk );
+  }
+  app->nk->style.window.fixed_background = orig;
+
+  /* RIGHT: results */
+  nk_layout_row_push( app->nk, 0.75f );
+  if ( nk_group_begin( app->nk, "tres_g", NK_WINDOW_BORDER | NK_WINDOW_TITLE ) )
+  {
+    _test_result_t *r = &app->test_result;
+
+    if ( !r->has_result )
+    {
+      nk_layout_row_dynamic( app->nk, 26, 1 );
+      nk_label( app->nk, "Navigate to a test image and press 'Run Inference'.", NK_TEXT_LEFT );
+    }
+    else
+    {
+      /* Verdict */
+      nk_layout_row_dynamic( app->nk, 34, 1 );
+      if ( r->is_correct ) nk_label_colored( app->nk, "CORRECT", NK_TEXT_CENTERED, nk_rgb( 60, 180, 60 ) );
+      else nk_label_colored( app->nk, "WRONG", NK_TEXT_CENTERED, nk_rgb( 220, 60, 60 ) );
+
+      /* Summary */
+      nk_layout_row_dynamic( app->nk, 22, 3 );
+      nk_labelf( app->nk, NK_TEXT_LEFT, "True label:  %d", r->true_label );
+      nk_labelf( app->nk, NK_TEXT_LEFT, "Predicted:   %d", r->predicted_label );
+      nk_labelf( app->nk, NK_TEXT_LEFT, "Confidence:  %.2f%%", r->probabilities[r->predicted_label] * 100.0f );
+
+      /* Probability bars */
+      nk_layout_row_dynamic( app->nk, 18, 1 );
+      nk_label( app->nk, "Class probabilities:", NK_TEXT_LEFT );
+
+      for ( int cls = 0; cls < NUM_CLASSES; cls++ )
+      {
+        float prob = r->probabilities[cls];
+        bool is_pred = ( cls == r->predicted_label );
+        bool is_truth = ( cls == r->true_label );
+
+        /* Digit label */
+        nk_layout_row_begin( app->nk, NK_DYNAMIC, 22, 3 );
+        nk_layout_row_push( app->nk, 0.06f );
+
+        char digit_buf[3] = { '0' + (char)cls, 0, 0 };
+        if ( is_pred && is_truth ) nk_label_colored( app->nk, digit_buf, NK_TEXT_CENTERED, nk_rgb( 60, 160, 60 ) ); /* green: correct pred */
+        else if ( is_pred ) nk_label_colored( app->nk, digit_buf, NK_TEXT_CENTERED, nk_rgb( 220, 60, 60 ) );        /* red: wrong pred */
+        else if ( is_truth ) nk_label_colored( app->nk, digit_buf, NK_TEXT_CENTERED, nk_rgb( 60, 100, 220 ) );      /* blue: true label */
+        else nk_label( app->nk, digit_buf, NK_TEXT_CENTERED );
+
+        /* Progress bar — maps [0, 1] to [0, 1000] for resolution */
+        nk_layout_row_push( app->nk, 0.78f );
+        nk_size bar_val = (nk_size)( prob * 1000.0f );
+        nk_progress( app->nk, &bar_val, 1000, NK_FIXED );
+
+        /* Percentage */
+        nk_layout_row_push( app->nk, 0.16f );
+        nk_labelf( app->nk, NK_TEXT_RIGHT, "%.2f%%", prob * 100.0f );
+
+        nk_layout_row_end( app->nk );
+      }
+
+      /* Colour legend */
+      nk_layout_row_dynamic( app->nk, 16, 1 );
+      nk_label( app->nk, "", NK_TEXT_LEFT );
+      nk_layout_row_dynamic( app->nk, 18, 3 );
+      nk_label_colored( app->nk, "Green = correct prediction", NK_TEXT_LEFT, nk_rgb( 60, 160, 60 ) );
+      nk_label_colored( app->nk, "Red = wrong prediction", NK_TEXT_LEFT, nk_rgb( 220, 60, 60 ) );
+      nk_label_colored( app->nk, "Blue = true label", NK_TEXT_LEFT, nk_rgb( 60, 100, 220 ) );
+    }
+    nk_group_end( app->nk );
+  }
+
+  nk_layout_row_end( app->nk );
+  nk_end( app->nk );
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ * Theme
+ * ════════════════════════════════════════════════════════════════════════ */
 static void apply_white_theme( struct nk_context *nk )
 {
   struct nk_color table[NK_COLOR_COUNT];

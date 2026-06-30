@@ -3,7 +3,6 @@
 
 #include "ds_arena.h"
 #include "networkd.h"
-/* #include "tensor.h" */
 #include <stdbool.h>
 
 typedef enum

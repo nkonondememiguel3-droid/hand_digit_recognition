@@ -7,13 +7,12 @@
 #include "tensor.h"
 
 #include <SDL3/SDL.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-/* ── Internal: build a one-hot (or label-smoothed) label batch ───────────
+/* -  Internal: build a one-hot (or label-smoothed) label batch
  *
  * Label smoothing replaces hard targets:
  *   y_smooth[correct] = 1 - ε + ε/C
@@ -33,13 +32,17 @@ static _tensor_t *build_label_batch( _ds_arena_t_ *arena, __dataset__ *ds, int b
 
   for ( int s = 0; s < batch_size; s++ )
   {
+    // load one label
     _tensor_t *lbl = load_label( arena, ds, batch_start + s );
     if ( !lbl ) return NULL;
 
+    // TODO: do not rely on the actual value of the label('cause this is specific for MNIST dataset), instead rely on the index of the labels array so
+    // it can be generalize.
     int cls = (int)lbl->data[0];
+    // silently remove invalide classes
     if ( cls < 0 || cls >= num_classes ) continue;
 
-    /* Fill smoothed baseline first */
+    // fill smoothed baseline first
     if ( smoothing > 0.0f )
       for ( int j = 0; j < num_classes; j++ ) T2( labels, s, j ) = smooth_val;
 
@@ -49,7 +52,7 @@ static _tensor_t *build_label_batch( _ds_arena_t_ *arena, __dataset__ *ds, int b
   return labels;
 }
 
-/* ── Internal: build an image batch [batch_size, 784] ───────────────────*/
+/* internal: build an image batch [batch_size, 784] */
 static _tensor_t *build_image_batch( _ds_arena_t_ *arena, __dataset__ *ds, int batch_start, int batch_size, int img_pixels )
 {
   int shape[] = { batch_size, img_pixels };
@@ -69,7 +72,7 @@ static _tensor_t *build_image_batch( _ds_arena_t_ *arena, __dataset__ *ds, int b
   return batch;
 }
 
-/* ── Internal: evaluate accuracy on up to `max_samples` from test_ds ────*/
+/* internal: evaluate accuracy on up to `max_samples` from test_ds */
 static float evaluate_accuracy( _network_t *network, __dataset__ *test_ds, int num_classes, int max_samples, _ds_arena_t_ *scratch )
 {
   int total = 0;
@@ -86,7 +89,7 @@ static float evaluate_accuracy( _network_t *network, __dataset__ *test_ds, int n
     _tensor_t *lbl = load_label( scratch, test_ds, i );
     if ( !img || !lbl ) break;
 
-    /* Wrap single image as [1, 784] */
+    /* wrap single image as [1, 784] */
     int shape[] = { 1, img_pixels };
     _tensor_t *input = tensor_zeros( scratch, 2, shape );
     if ( !input ) break;
@@ -95,7 +98,7 @@ static float evaluate_accuracy( _network_t *network, __dataset__ *test_ds, int n
     _tensor_t *logits = network->forward( network, scratch, input );
     if ( !logits ) break;
 
-    /* Find argmax of logits */
+    /* find argmax of logits */
     int pred = 0;
     float best_val = logits->data[0];
     for ( int j = 1; j < num_classes; j++ )
@@ -115,7 +118,7 @@ static float evaluate_accuracy( _network_t *network, __dataset__ *test_ds, int n
   return total > 0 ? (float)correct / (float)total : 0.0f;
 }
 
-/* ── Internal: write one metric sample into the ring buffer (mutex held) */
+/* Internal: write one metric sample into the ring buffer (mutex held) */
 static void push_metric( _training_state_t *state, float loss, float acc )
 {
   state->loss_history[state->history_head] = loss;
@@ -124,7 +127,7 @@ static void push_metric( _training_state_t *state, float loss, float acc )
   if ( state->history_count < TRAINING_HISTORY_CAP ) state->history_count++;
 }
 
-/* ── Training thread entry point ─────────────────────────────────────── */
+/* Training thread entry point */
 static int training_thread_fn( void *userdata )
 {
   _training_ctx_t *ctx = (_training_ctx_t *)userdata;
@@ -141,7 +144,7 @@ static int training_thread_fn( void *userdata )
   /* Seed random per thread so weights initialise differently each run */
   srand( (unsigned int)time( NULL ) );
 
-  /* ── Epoch loop ── */
+  /* Epoch loop */
   for ( int epoch = 1; epoch <= cfg.epochs; epoch++ )
   {
     /* Check stop signal before starting a new epoch */
@@ -153,10 +156,10 @@ static int training_thread_fn( void *userdata )
     float epoch_loss_sum = 0.0f;
     int epoch_batches = 0;
 
-    /* ── Batch loop ── */
+    /* Batch loop */
     for ( int b = 0; b < total_batches; b++ )
     {
-      /* Pause support — spin-wait while paused */
+      /* Pause support - spin-wait while paused */
       for ( ;; )
       {
         SDL_LockMutex( state->mutex );
@@ -170,10 +173,10 @@ static int training_thread_fn( void *userdata )
 
       int batch_start = b * cfg.batch_size;
 
-      /* Checkpoint batch arena — reset at end of each batch */
+      // Checkpoint batch arena - reset at end of each batch
       _ds_arena_checkpoint_t_ cp = ds_arena_checkpoint( &ctx->batch_arena );
 
-      /* ── Build input and label batch ── */
+      // Build input and label batch
       _tensor_t *input = build_image_batch( &ctx->batch_arena, ds, batch_start, cfg.batch_size, img_pixels );
       _tensor_t *labels = build_label_batch( &ctx->batch_arena, ds, batch_start, cfg.batch_size, cfg.num_classes, cfg.label_smoothing );
       if ( !input || !labels )
@@ -182,7 +185,7 @@ static int training_thread_fn( void *userdata )
         continue;
       }
 
-      /* ── Forward ── */
+      // forward
       _tensor_t *logits = net->forward( net, &ctx->batch_arena, input );
       if ( !logits )
       {
@@ -190,7 +193,7 @@ static int training_thread_fn( void *userdata )
         continue;
       }
 
-      /* ── Loss ── */
+      // loss
       _loss_result_t result = loss_softmax_cross_entropy( &ctx->batch_arena, logits, labels );
       if ( !result.loss )
       {
@@ -198,39 +201,40 @@ static int training_thread_fn( void *userdata )
         continue;
       }
 
-      float batch_loss = result.loss->data[0];
+      /* float batch_loss = result.loss->data[0]; */
+      float batch_loss = T1( result.loss, 0 );
       epoch_loss_sum += batch_loss;
       epoch_batches++;
 
-      /* ── Backward ── */
+      // backward
       network_zero_gradients( net );
       net->backward( net, &ctx->batch_arena, result.gradients );
 
-      /* ── Optimizer step ── */
+      // optimizer step
       optimizer_step( opt, net );
 
-      /* ── Reclaim batch memory ── */
+      // reclaim batch memory
       ds_arena_reset_to( &ctx->batch_arena, cp );
 
-      /* ── Update shared state ── */
+      // update shared state
       SDL_LockMutex( state->mutex );
       state->epoch = epoch;
       state->total_epochs = cfg.epochs;
       state->batch = b + 1;
       state->total_batches = total_batches;
-      push_metric( state, batch_loss, 0.0f ); /* acc updated per epoch */
+      push_metric( state, batch_loss, 0.0f ); // acc updated per epoch
       SDL_UnlockMutex( state->mutex );
 
-      /* Log to stdout every 100 batches */
+      // log to stdout every 100 batches
       if ( ( b + 1 ) % 100 == 0 ) printf( "Epoch %d/%d  Batch %d/%d  Loss: %.4f\n", epoch, cfg.epochs, b + 1, total_batches, batch_loss );
     }
 
-    /* ── End-of-epoch accuracy evaluation (1000 test samples) ── */
+    /* End-of-epoch accuracy evaluation (1000 test samples) */
     float epoch_loss = epoch_batches > 0 ? epoch_loss_sum / (float)epoch_batches : 0.0f;
 
     float epoch_acc = ctx->test_ds ? evaluate_accuracy( net, ctx->test_ds, cfg.num_classes, 1000, &ctx->batch_arena ) : 0.0f;
 
-    printf( "── Epoch %d/%d  Loss: %.4f  Acc: %.2f%%\n", epoch, cfg.epochs, epoch_loss, epoch_acc * 100.0f );
+    printf( "Epoch %d/%d  Loss: %.4f  Acc: %.2f%%\n", epoch, cfg.epochs, epoch_loss, epoch_acc * 100.0f );
 
     SDL_LockMutex( state->mutex );
     state->epoch_loss = epoch_loss;
@@ -250,8 +254,7 @@ training_done:
   return 0;
 }
 
-/* ── Public API ───────────────────────────────────────────────────────── */
-
+/* public api */
 _training_state_t *training_state_create( _ds_arena_t_ *arena )
 {
   _training_state_t *state = ARENA_NEW( arena, _training_state_t );

@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ── Internal: count layers that have learnable parameters ──────────────*/
+/* Internal: count layers that have learnable parameters */
 static int count_param_layers( _network_t *network )
 {
   int count = 0;
@@ -126,7 +126,7 @@ _optimizer_t *optimizer_create_adam( _ds_arena_t_ *arena, _network_t *network, _
   return opt;
 }
 
-/* ── Internal: apply SGD update to one parameter tensor ─────────────────*/
+/* Internal: apply SGD update to one parameter tensor */
 static void sgd_update_param( float *params, float *grads, float *velocity, int size, _sgd_config_t cfg )
 {
   float lr = cfg.learning_rate;
@@ -146,7 +146,7 @@ static void sgd_update_param( float *params, float *grads, float *velocity, int 
   }
 }
 
-/* ── Internal: apply Adam update to one parameter tensor ─────────────── */
+/* Internal: apply Adam update to one parameter tensor */
 static void adam_update_param( float *params, float *grads, float *m, float *v, int size, _adam_config_t cfg, int step )
 {
   float lr = cfg.learning_rate;
@@ -176,7 +176,7 @@ static void adam_update_param( float *params, float *grads, float *m, float *v, 
   }
 }
 
-/* ── optimizer_step ───────────────────────────────────────────────────── */
+/* optimizer_step */
 void optimizer_step( _optimizer_t *opt, _network_t *network )
 {
   opt->step++;
