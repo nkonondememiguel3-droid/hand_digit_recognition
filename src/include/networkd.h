@@ -45,5 +45,18 @@ extern void network_add_skip( _network_node_t *source, _network_node_t *destinat
 extern void network_zero_gradients( _network_t *network );
 
 extern void network_print( const _network_t *network );
+/* ── Add to network.h ─────────────────────────────────────────────────── */
+
+/*
+ * network_add_layer_checked — like network_add_layer, but validates that
+ * the new layer's in_shape matches the network's current output shape
+ * (i.e. the tail node's out_shape). Returns false and logs an error on
+ * mismatch, leaving the network unchanged.
+ *
+ * Pass NULL for `layer->in_shape` validation if the layer is shape-
+ * agnostic (e.g. activation layers that pass through whatever shape
+ * they receive) -- ndim=0 is treated as "accepts anything".
+ */
+extern bool network_add_layer_checked( _ds_arena_t_ *persist_arena, _network_t *network, _layer_t *layer );
 
 #endif // hand_digit_recognition_network

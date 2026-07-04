@@ -625,6 +625,7 @@ static void render_training_panel( App *app, float x, float y, float w, float h 
   if ( !m->is_training )
   {
     bool can_start = app->config.is_applied && !app->config.is_dirty;
+    SDL_Log( "can_start=%d is_applied=%d is_dirty=%d", can_start, app->config.is_applied, app->config.is_dirty );
 
     if ( !can_start )
     {
@@ -1153,14 +1154,11 @@ static void render_config_panel( App *app, float x, float y, float w, float h )
   else nk_label_colored( app->nk, "Status: Not applied yet", NK_TEXT_LEFT, nk_rgb( 220, 60, 60 ) );
 
   nk_layout_row_dynamic( app->nk, 40, 1 );
-  nk_widget_disable_begin( app->nk );
-  if ( training_active )
+  if ( nk_button_label( app->nk, "Apply Configuration" ) )
   {
-    /* visually disabled — Nuklear doesn't have true widget-disable
-       without the extended API, so we just block the action inline */
+    if ( !training_active ) apply_network_config( app );
+    else SDL_LogWarn( SDL_LOG_CATEGORY_APPLICATION, "Cannot apply while training is active" );
   }
-  if ( nk_button_label( app->nk, "Apply Configuration" ) && !training_active ) { apply_network_config( app ); }
-  nk_widget_disable_end( app->nk );
 
   nk_end( app->nk );
 }

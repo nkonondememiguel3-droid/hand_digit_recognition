@@ -151,13 +151,21 @@ void network_zero_gradients( _network_t *network )
 void network_print( const _network_t *network )
 {
   printf( "network (%d layers)\n", network->number_layers );
-  printf( "-------------------------------------------------------" );
+  printf( "-------------------------------------------------------\n" );
 
   _network_node_t *node = network->head;
   int index = 0;
   while ( node != NULL )
   {
-    printf( "[%2d] %-20s in: %-6d out: %-6d", index, node->layer->layer_name, node->layer->in_dimension, node->layer->out_dimension );
+    /* ✅ in_shape/out_shape replace in_dimension/out_dimension.
+       dims[1] is the "feature" dimension for dense-style layers;
+       for shape-agnostic layers (relu/sigmoid) ndim==0 so we print
+       "-" instead of a meaningless 0.                              */
+    if ( node->layer->in_shape.ndim > 0 && node->layer->out_shape.ndim > 0 )
+    {
+      printf( "[%2d] %-20s in: %-6d out: %-6d", index, node->layer->layer_name, node->layer->in_shape.dims[1], node->layer->out_shape.dims[1] );
+    }
+    else { printf( "[%2d] %-20s in: %-6s out: %-6s", index, node->layer->layer_name, "-", "-" ); }
 
     if ( node->skip_source ) printf( " <- skip from [%s]", node->skip_source->layer->layer_name );
 
@@ -165,5 +173,37 @@ void network_print( const _network_t *network )
     node = node->next;
     index++;
   }
-  printf( "------------------------------------------------" );
+  printf( "------------------------------------------------\n" );
+}
+
+/* ── network.c addition ──────────────────────────────────────────────── */
+bool network_add_layer_checked( _ds_arena_t_ *persist_arena, _network_t *network, _layer_t *layer )
+{
+  if ( network->tail != NULL && layer->in_shape.ndim > 0 )
+  {
+    _layer_shape_t *prev_out = &network->tail->layer->out_shape;
+    if ( prev_out->ndim > 0 )
+    {
+      bool compatible = ( prev_out->ndim == layer->in_shape.ndim );
+      if ( compatible )
+        for ( int i = 1; i < prev_out->ndim; i++ ) /* skip batch dim */
+          if ( prev_out->dims[i] != layer->in_shape.dims[i] )
+          {
+            compatible = false;
+            break;
+          }
+
+      if ( !compatible )
+      {
+        fprintf( stderr,
+                 "network_add_layer_checked: shape mismatch -- '%s' outputs "
+                 "ndim=%d but '%s' expects ndim=%d\n",
+                 network->tail->layer->layer_name, prev_out->ndim, layer->layer_name, layer->in_shape.ndim );
+        return false;
+      }
+    }
+  }
+
+  network_add_layer( persist_arena, network, layer );
+  return true;
 }

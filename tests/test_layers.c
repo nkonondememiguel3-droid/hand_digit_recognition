@@ -38,8 +38,8 @@ Test( layers, dense_layer_type )
 Test( layers, dense_dimensions_stored )
 {
   _layer_t *dense = layer_create_dense( &param_arena, 128, 64 );
-  cr_assert_eq( dense->in_dimension, 128 );
-  cr_assert_eq( dense->out_dimension, 64 );
+  cr_assert_eq( dense->in_shape.dims[0], 128 );
+  cr_assert_eq( dense->out_shape.dims[1], 64 );
 }
 
 Test( layers, dense_weights_shape )
@@ -177,7 +177,7 @@ Test( layers, dense_forward_caches_last_input )
   _tensor_t *input = tensor_zeros( &batch_arena, 2, input_shape );
   _layer_t *dense = layer_create_dense( &param_arena, 4, 2 );
   dense->forward( &batch_arena, dense, input );
-  cr_assert_eq( dense->last_input, input );
+  cr_assert_eq( dense->cache, input );
 }
 
 Test( layers, dense_forward_wrong_feature_count_returns_null )
@@ -378,8 +378,8 @@ Test( layers, sigmoid_has_no_weights_or_bias )
 Test( layers, sigmoid_dimensions_are_zero )
 {
   _layer_t *sigmoid = layer_create_sigmoid( &param_arena );
-  cr_assert_eq( sigmoid->in_dimension, 0 );
-  cr_assert_eq( sigmoid->out_dimension, 0 );
+  cr_assert_eq( sigmoid->in_shape.dims, 0 );
+  cr_assert_eq( sigmoid->out_shape.dims, 0 );
 }
 
 Test( layers, sigmoid_forward_backward_fn_not_null )
@@ -465,8 +465,8 @@ Test( layers, sigmoid_caches_output_not_input )
   _layer_t *sigmoid = layer_create_sigmoid( &param_arena );
   _tensor_t *output = sigmoid->forward( &batch_arena, sigmoid, input );
 
-  cr_assert_eq( sigmoid->last_input, output, "sigmoid should cache its OUTPUT, not its input" );
-  cr_assert_neq( sigmoid->last_input, input );
+  cr_assert_eq( sigmoid->cache, output, "sigmoid should cache its OUTPUT, not its input" );
+  cr_assert_neq( sigmoid->cache, input );
 }
 
 Test( layers, sigmoid_backward_shape_preserved )
