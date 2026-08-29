@@ -38,7 +38,10 @@ Test( layers, dense_layer_type )
 Test( layers, dense_dimensions_stored )
 {
   _layer_t *dense = layer_create_dense( &param_arena, 128, 64 );
-  cr_assert_eq( dense->in_shape.dims[0], 128 );
+  /* dims[0] is the batch slot (0 == batch-agnostic); features live in dims[1] */
+  cr_assert_eq( dense->in_shape.ndim, 2 );
+  cr_assert_eq( dense->in_shape.dims[0], 0 );
+  cr_assert_eq( dense->in_shape.dims[1], 128 );
   cr_assert_eq( dense->out_shape.dims[1], 64 );
 }
 
@@ -378,8 +381,10 @@ Test( layers, sigmoid_has_no_weights_or_bias )
 Test( layers, sigmoid_dimensions_are_zero )
 {
   _layer_t *sigmoid = layer_create_sigmoid( &param_arena );
-  cr_assert_eq( sigmoid->in_shape.dims, 0 );
-  cr_assert_eq( sigmoid->out_shape.dims, 0 );
+  /* ndim == 0 is what marks an activation as shape-agnostic. Comparing the
+     dims array itself would compare a never-null pointer against 0. */
+  cr_assert_eq( sigmoid->in_shape.ndim, 0 );
+  cr_assert_eq( sigmoid->out_shape.ndim, 0 );
 }
 
 Test( layers, sigmoid_forward_backward_fn_not_null )
@@ -580,7 +585,7 @@ Test( layers, dense_sigmoid_stacked_backward_chain_rule )
   _tensor_t *input = tensor_ones( &batch_arena, 2, input_shape );
 
   _tensor_t *dense_out = dense->forward( &batch_arena, dense, input );
-  _tensor_t *sigmoid_out = sigmoid->forward( &batch_arena, sigmoid, dense_out );
+  sigmoid->forward( &batch_arena, sigmoid, dense_out );
 
   int upstream_shape[] = { 1, 2 };
   _tensor_t *upstream = tensor_ones( &batch_arena, 2, upstream_shape );

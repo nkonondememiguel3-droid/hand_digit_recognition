@@ -14,6 +14,12 @@ struct _network_node_
   _layer_t *layer;
   _tensor_t *output;
   _network_node_t *skip_source;
+
+  /* Gradient routed back to this node from every layer that takes it as a
+     skip source. Allocated in the batch arena during backward(), cleared at
+     the start of each backward pass. NULL when this node feeds no skip. */
+  _tensor_t *skip_gradients;
+
   _network_node_t *next;
   _network_node_t *prev;
 };

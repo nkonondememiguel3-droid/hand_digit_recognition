@@ -86,6 +86,11 @@ if(CRITERION_FOUND)
     target_include_directories(test_loses PRIVATE ${CRITERION_INCLUDE_DIRS})
     add_test(NAME loses_tests COMMAND test_loses)
 
+    add_executable(test_optimizer tests/test_optimizer.c)
+    target_link_libraries(test_optimizer recognition_lib ${CRITERION_LIBRARIES} m)
+    target_include_directories(test_optimizer PRIVATE ${CRITERION_INCLUDE_DIRS})
+    add_test(NAME optimizer_tests COMMAND test_optimizer)
+
     add_executable(test_network tests/test_network.c)
     target_link_libraries(test_network recognition_lib ${CRITERION_LIBRARIES} m)
     target_include_directories(test_network PRIVATE ${CRITERION_INCLUDE_DIRS})

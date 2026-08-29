@@ -9,7 +9,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define NK_INCLUDE_STANDARD_VARARGS
 #define NK_INCLUDE_STANDARD_IO
@@ -88,9 +90,14 @@ typedef struct
   _ds_arena_t_ infer_arena;
   _ds_arena_t_ weight_arena;
 
-  /* Datasets */
+  /* Datasets — the UI thread reads through these */
   __dataset__ *train_ds;
   __dataset__ *test_ds;
+
+  /* Separate handles owned by the training thread. Seek+read is not atomic
+     on a shared FILE*, so every thread that reads a dataset gets its own. */
+  __dataset__ *trainer_train_ds;
+  __dataset__ *trainer_test_ds;
 
   /* Viewer */
   uint32_t current_index;
@@ -130,6 +137,9 @@ typedef struct
 
 static void render_config_panel( App *app, float x, float y, float w, float h );
 static void apply_network_config( App *app );
+static bool training_is_active( App *app );
+static bool eval_is_running( App *app );
+static bool network_is_idle( App *app );
 
 /* Forward declarations */
 static void apply_white_theme( struct nk_context *nk );
@@ -142,6 +152,33 @@ static void render_viewer_panel( App *app, float x, float y, float w, float h );
 static void render_training_panel( App *app, float x, float y, float w, float h );
 static void render_testing_panel( App *app, float x, float y, float w, float h );
 
+/* ── Shared-state predicates ──────────────────────────────────────────────
+ *
+ * The network carries one activation cache per layer, so only one thread may
+ * run a forward pass at a time. These guard every entry point that touches it.
+ */
+static bool training_is_active( App *app )
+{
+  SDL_LockMutex( app->training_state->mutex );
+  bool active = app->training_state->is_training;
+  SDL_UnlockMutex( app->training_state->mutex );
+  return active;
+}
+
+static bool eval_is_running( App *app )
+{
+  SDL_LockMutex( app->eval_mutex );
+  bool running = app->eval.is_running;
+  SDL_UnlockMutex( app->eval_mutex );
+  return running;
+}
+
+/* True when no background thread is using the network. */
+static bool network_is_idle( App *app )
+{
+  return app->network != NULL && !training_is_active( app ) && !eval_is_running( app );
+}
+
 /* ════════════════════════════════════════════════════════════════════════
  * Entry point
  * ════════════════════════════════════════════════════════════════════════ */
@@ -152,6 +189,10 @@ int main( void )
     SDL_LogError( SDL_LOG_CATEGORY_ERROR, "SDL init failed: %s", SDL_GetError() );
     return SDL_APP_FAILURE;
   }
+
+  /* Seed before the first network is built -- weight initialisation runs
+     through rand(), so without this every run starts from the same weights. */
+  srand( (unsigned int)time( NULL ) );
 
   App app;
   memset( &app, 0, sizeof( App ) );
@@ -175,7 +216,9 @@ int main( void )
 
   app.train_ds = dataset_init( &app.arena, TRAIN_IMG_PATH, TRAIN_LBL_PATH );
   app.test_ds = dataset_init( &app.arena, TEST_IMG_PATH, TEST_LBL_PATH );
-  if ( !app.train_ds || !app.test_ds )
+  app.trainer_train_ds = dataset_init( &app.arena, TRAIN_IMG_PATH, TRAIN_LBL_PATH );
+  app.trainer_test_ds = dataset_init( &app.arena, TEST_IMG_PATH, TEST_LBL_PATH );
+  if ( !app.train_ds || !app.test_ds || !app.trainer_train_ds || !app.trainer_test_ds )
   {
     SDL_LogError( SDL_LOG_CATEGORY_ERROR, "Failed to open datasets" );
     return SDL_APP_FAILURE;
@@ -188,12 +231,14 @@ int main( void )
   }
 
   app.training_state = training_state_create( &app.arena );
+  if ( !app.training_state )
+  {
+    SDL_LogError( SDL_LOG_CATEGORY_ERROR, "Failed to create training state" );
+    return SDL_APP_FAILURE;
+  }
   app.eval_mutex = SDL_CreateMutex();
 
   apply_network_config( &app );
-
-  app.train_ds = dataset_init( &app.arena, TRAIN_IMG_PATH, TRAIN_LBL_PATH );
-  app.test_ds = dataset_init( &app.arena, TEST_IMG_PATH, TEST_LBL_PATH );
 
   app.nk = nk_sdl_init( app.window, app.renderer, nk_sdl_allocator() );
   {
@@ -250,6 +295,19 @@ int main( void )
     nk_input_end( app.nk );
 
     training_read_metrics( app.training_state, &app.metrics );
+
+    /* Join workers as soon as they finish, so a handle is never overwritten
+       by the next run and the thread's resources are released. */
+    if ( app.training_thread && !app.metrics.is_training )
+    {
+      SDL_WaitThread( app.training_thread, NULL );
+      app.training_thread = NULL;
+    }
+    if ( app.eval.thread && !eval_is_running( &app ) )
+    {
+      SDL_WaitThread( app.eval.thread, NULL );
+      app.eval.thread = NULL;
+    }
 
     int win_w, win_h;
     SDL_GetWindowSize( app.window, &win_w, &win_h );
@@ -312,6 +370,8 @@ int main( void )
 
   if ( app.train_ds ) dataset_close( app.train_ds );
   if ( app.test_ds ) dataset_close( app.test_ds );
+  if ( app.trainer_train_ds ) dataset_close( app.trainer_train_ds );
+  if ( app.trainer_test_ds ) dataset_close( app.trainer_test_ds );
 
   ds_arena_destroy( &app.infer_arena );
   ds_arena_destroy( &app.scratch_arena );
@@ -340,6 +400,10 @@ static void softmax_inplace( float *logits, float *probs, int n )
 
 static void run_inference( App *app, int idx )
 {
+  /* The training and eval threads mutate every layer's activation cache.
+     Running a forward pass alongside them corrupts both. */
+  if ( !network_is_idle( app ) ) return;
+
   _ds_arena_checkpoint_t_ cp = ds_arena_checkpoint( &app->infer_arena );
 
   _tensor_t *img = load_image( &app->infer_arena, app->test_ds, idx );
@@ -390,16 +454,24 @@ static void run_inference( App *app, int idx )
 }
 
 /* Full-dataset evaluation thread */
-typedef struct
-{
-  App *app;
-} _eval_arg_t;
-
 static int eval_thread_fn( void *ud )
 {
-  App *app = ( (_eval_arg_t *)ud )->app;
-  int total = (int)app->test_ds->image_header.count;
+  App *app = (App *)ud;
   _ds_arena_t_ ea = ds_arena_new( 0 );
+
+  /* Private handles: seek+read is not atomic on a FILE* shared with the UI */
+  __dataset__ *test_ds = dataset_init( &ea, TEST_IMG_PATH, TEST_LBL_PATH );
+  if ( !test_ds )
+  {
+    SDL_LogError( SDL_LOG_CATEGORY_APPLICATION, "Eval: failed to open the test dataset" );
+    SDL_LockMutex( app->eval_mutex );
+    app->eval.is_running = false;
+    SDL_UnlockMutex( app->eval_mutex );
+    ds_arena_destroy( &ea );
+    return 0;
+  }
+
+  int total = (int)test_ds->image_header.count;
 
   SDL_LockMutex( app->eval_mutex );
   app->eval.total = total;
@@ -417,8 +489,8 @@ static int eval_thread_fn( void *ud )
 
     _ds_arena_checkpoint_t_ cp = ds_arena_checkpoint( &ea );
 
-    _tensor_t *img = load_image( &ea, app->test_ds, i );
-    _tensor_t *lbl = load_label( &ea, app->test_ds, i );
+    _tensor_t *img = load_image( &ea, test_ds, i );
+    _tensor_t *lbl = load_label( &ea, test_ds, i );
     if ( !img || !lbl )
     {
       ds_arena_reset_to( &ea, cp );
@@ -465,6 +537,7 @@ static int eval_thread_fn( void *ud )
   app->eval.is_running = false;
   SDL_UnlockMutex( app->eval_mutex );
 
+  dataset_close( test_ds );
   ds_arena_destroy( &ea );
   return 0;
 }
@@ -483,7 +556,10 @@ static SDL_Texture *tensor_to_texture( SDL_Renderer *r, const _tensor_t *img )
     rgba[i * 4 + 2] = v;
     rgba[i * 4 + 3] = 255;
   }
-  SDL_Texture *tex = SDL_CreateTexture( r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STATIC, IMG_NATIVE_SIZE, IMG_NATIVE_SIZE );
+  /* RGBA32 is the byte-order-correct alias for the {r,g,b,a} bytes written
+     above; RGBA8888 is a packed format and reads them reversed on a
+     little-endian host. */
+  SDL_Texture *tex = SDL_CreateTexture( r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, IMG_NATIVE_SIZE, IMG_NATIVE_SIZE );
   if ( !tex ) return NULL;
   SDL_SetTextureScaleMode( tex, SDL_SCALEMODE_NEAREST );
   SDL_UpdateTexture( tex, NULL, rgba, IMG_NATIVE_SIZE * 4 );
@@ -624,12 +700,12 @@ static void render_training_panel( App *app, float x, float y, float w, float h 
 
   if ( !m->is_training )
   {
-    bool can_start = app->config.is_applied && !app->config.is_dirty;
-    SDL_Log( "can_start=%d is_applied=%d is_dirty=%d", can_start, app->config.is_applied, app->config.is_dirty );
+    bool can_start = app->config.is_applied && !app->config.is_dirty && app->network != NULL && !eval_is_running( app );
 
     if ( !can_start )
     {
-      nk_label( app->nk, "Configure and Apply a network in the Architecture tab first.", NK_TEXT_LEFT );
+      if ( eval_is_running( app ) ) nk_label( app->nk, "Full evaluation is running -- wait for it to finish.", NK_TEXT_LEFT );
+      else nk_label( app->nk, "Configure and Apply a network in the Architecture tab first.", NK_TEXT_LEFT );
       nk_label( app->nk, "", NK_TEXT_LEFT );
       nk_label( app->nk, "", NK_TEXT_LEFT );
     }
@@ -637,14 +713,15 @@ static void render_training_panel( App *app, float x, float y, float w, float h 
     {
       if ( nk_button_label( app->nk, "Start Training" ) )
       {
+        /* The previous run's thread is joined in the main loop as soon as it
+           reports it has stopped, so the handle is free here. */
         app->training_ctx = ARENA_NEW( &app->weight_arena, _training_ctx_t );
         app->training_ctx->state = app->training_state;
         app->training_ctx->network = app->network;
         app->training_ctx->optimizer = app->optimizer;
-        app->training_ctx->train_ds = app->train_ds;
-        app->training_ctx->test_ds = app->test_ds;
+        app->training_ctx->train_ds = app->trainer_train_ds;
+        app->training_ctx->test_ds = app->trainer_test_ds;
         app->training_ctx->config = training_config_defaults();
-        app->training_ctx->weight_arena = app->weight_arena;
         app->training_ctx->batch_arena = ds_arena_new( 0 );
         app->training_thread = training_start( app->training_ctx );
       }
@@ -728,39 +805,21 @@ static void render_testing_panel( App *app, float x, float y, float w, float h )
 
   uint32_t test_count = app->test_ds->image_header.count;
 
+  bool training_active = training_is_active( app );
+  bool eval_running = eval_is_running( app );
+  bool network_busy = training_active || eval_running || app->network == NULL;
+
   /* Top controls */
   nk_layout_row_dynamic( app->nk, 32, 5 );
   if ( nk_button_label( app->nk, "<  Prev" ) ) navigate_test( app, -1 );
   nk_labelf( app->nk, NK_TEXT_CENTERED, "%d / %u", app->test_index + 1, test_count );
   if ( nk_button_label( app->nk, "Next  >" ) ) navigate_test( app, +1 );
-  if ( nk_button_label( app->nk, "Run Inference" ) ) run_inference( app, app->test_index );
+
+  if ( network_busy ) nk_label( app->nk, "", NK_TEXT_LEFT );
+  else if ( nk_button_label( app->nk, "Run Inference" ) ) run_inference( app, app->test_index );
 
   /* Full-eval button */
-  SDL_LockMutex( app->eval_mutex );
-  bool eval_running = app->eval.is_running;
-  SDL_UnlockMutex( app->eval_mutex );
-
-  if ( !eval_running )
-  {
-    if ( nk_button_label( app->nk, "Eval All (10k)" ) )
-    {
-      if ( app->eval.thread )
-      {
-        SDL_LockMutex( app->eval_mutex );
-        app->eval.is_running = false;
-        SDL_UnlockMutex( app->eval_mutex );
-        SDL_WaitThread( app->eval.thread, NULL );
-        app->eval.thread = NULL;
-      }
-      SDL_LockMutex( app->eval_mutex );
-      app->eval.is_running = true;
-      SDL_UnlockMutex( app->eval_mutex );
-      _eval_arg_t *arg = ARENA_NEW( &app->arena, _eval_arg_t );
-      arg->app = app;
-      app->eval.thread = SDL_CreateThread( eval_thread_fn, "eval", arg );
-    }
-  }
-  else
+  if ( eval_running )
   {
     if ( nk_button_label( app->nk, "Stop Eval" ) )
     {
@@ -768,6 +827,24 @@ static void render_testing_panel( App *app, float x, float y, float w, float h )
       app->eval.is_running = false;
       SDL_UnlockMutex( app->eval_mutex );
     }
+  }
+  else if ( network_busy ) { nk_label( app->nk, "", NK_TEXT_LEFT ); }
+  else if ( nk_button_label( app->nk, "Eval All (10k)" ) )
+  {
+    SDL_LockMutex( app->eval_mutex );
+    app->eval.is_running = true;
+    SDL_UnlockMutex( app->eval_mutex );
+    app->eval.thread = SDL_CreateThread( eval_thread_fn, "eval", app );
+  }
+
+  if ( network_busy )
+  {
+    nk_layout_row_dynamic( app->nk, 22, 1 );
+    if ( app->network == NULL )
+      nk_label_colored( app->nk, "Apply a network in the Architecture tab before testing.", NK_TEXT_LEFT, nk_rgb( 220, 60, 60 ) );
+    else if ( training_active )
+      nk_label_colored( app->nk, "Training is running -- stop it to test single images.", NK_TEXT_LEFT, nk_rgb( 220, 150, 40 ) );
+    else nk_label_colored( app->nk, "Full evaluation is running -- single-image testing is paused.", NK_TEXT_LEFT, nk_rgb( 220, 150, 40 ) );
   }
 
   /* Full-eval progress bar */
@@ -898,7 +975,10 @@ static void render_testing_panel( App *app, float x, float y, float w, float h )
  * ════════════════════════════════════════════════════════════════════════ */
 static void apply_white_theme( struct nk_context *nk )
 {
-  struct nk_color table[NK_COLOR_COUNT];
+  /* Zero-initialised so that any colour this file does not name explicitly
+     is still defined -- nk_style_from_table reads all NK_COLOR_COUNT entries,
+     and this Nuklear carries a knob family past NK_COLOR_TAB_HEADER. */
+  struct nk_color table[NK_COLOR_COUNT] = { 0 };
   nk_style_default( nk );
   table[NK_COLOR_TEXT] = nk_rgb( 30, 30, 30 );
   table[NK_COLOR_WINDOW] = nk_rgb( 250, 250, 248 );
@@ -928,6 +1008,10 @@ static void apply_white_theme( struct nk_context *nk )
   table[NK_COLOR_SCROLLBAR_CURSOR_HOVER] = nk_rgb( 170, 170, 165 );
   table[NK_COLOR_SCROLLBAR_CURSOR_ACTIVE] = nk_rgb( 150, 150, 145 );
   table[NK_COLOR_TAB_HEADER] = nk_rgb( 230, 230, 225 );
+  table[NK_COLOR_KNOB] = nk_rgb( 230, 230, 225 );
+  table[NK_COLOR_KNOB_CURSOR] = nk_rgb( 180, 180, 175 );
+  table[NK_COLOR_KNOB_CURSOR_HOVER] = nk_rgb( 165, 165, 160 );
+  table[NK_COLOR_KNOB_CURSOR_ACTIVE] = nk_rgb( 150, 150, 145 );
   nk_style_from_table( nk, table );
 }
 
@@ -936,16 +1020,18 @@ static void apply_white_theme( struct nk_context *nk )
  * ════════════════════════════════════════════════════════════════════════ */
 static void apply_network_config( App *app )
 {
-  /* Refuse to rebuild while training is in progress — the training
-     thread holds raw pointers into the old network/weight_arena, and
-     swapping them out from under it would be a use-after-free.        */
-  SDL_LockMutex( app->training_state->mutex );
-  bool training_active = app->training_state->is_training;
-  SDL_UnlockMutex( app->training_state->mutex );
-
-  if ( training_active )
+  /* Refuse to rebuild while a worker thread is running — both the training
+     and the evaluation thread hold raw pointers into the old network and
+     weight_arena, and swapping them out underneath is a use-after-free. */
+  if ( training_is_active( app ) )
   {
     SDL_LogWarn( SDL_LOG_CATEGORY_APPLICATION, "Cannot apply config while training is in progress" );
+    return;
+  }
+
+  if ( eval_is_running( app ) )
+  {
+    SDL_LogWarn( SDL_LOG_CATEGORY_APPLICATION, "Cannot apply config while a full evaluation is running" );
     return;
   }
 
@@ -960,13 +1046,19 @@ static void apply_network_config( App *app )
   if ( !network_config_build( &app->weight_arena, &app->config, &new_net, &new_opt ) )
   {
     SDL_LogError( SDL_LOG_CATEGORY_APPLICATION, "Failed to build network from config" );
-    /* Re-create an empty arena so we don't leave a destroyed one behind */
+    /* The old network lived in the arena that was just destroyed -- clear the
+       pointers rather than leaving them dangling. */
+    app->network = NULL;
+    app->optimizer = NULL;
+    app->training_ctx = NULL;
+    app->test_result.has_result = false;
     app->config.is_applied = false;
     return;
   }
 
   app->network = new_net;
   app->optimizer = new_opt;
+  app->training_ctx = NULL; /* the old context lived in the destroyed arena */
 
   /* Reset training metrics — old loss/accuracy history belongs to the
      previous architecture and is meaningless for the new one.         */
@@ -1001,14 +1093,12 @@ static void render_config_panel( App *app, float x, float y, float w, float h )
     return;
   }
 
-  SDL_LockMutex( app->training_state->mutex );
-  bool training_active = app->training_state->is_training;
-  SDL_UnlockMutex( app->training_state->mutex );
+  bool worker_busy = training_is_active( app ) || eval_is_running( app );
 
-  if ( training_active )
+  if ( worker_busy )
   {
     nk_layout_row_dynamic( app->nk, 28, 1 );
-    nk_label_colored( app->nk, "Stop training before editing the architecture.", NK_TEXT_LEFT, nk_rgb( 220, 60, 60 ) );
+    nk_label_colored( app->nk, "Stop training and evaluation before rebuilding the network.", NK_TEXT_LEFT, nk_rgb( 220, 60, 60 ) );
   }
 
   /* ── Fixed input/output dims (display only) ── */
@@ -1154,11 +1244,7 @@ static void render_config_panel( App *app, float x, float y, float w, float h )
   else nk_label_colored( app->nk, "Status: Not applied yet", NK_TEXT_LEFT, nk_rgb( 220, 60, 60 ) );
 
   nk_layout_row_dynamic( app->nk, 40, 1 );
-  if ( nk_button_label( app->nk, "Apply Configuration" ) )
-  {
-    if ( !training_active ) apply_network_config( app );
-    else SDL_LogWarn( SDL_LOG_CATEGORY_APPLICATION, "Cannot apply while training is active" );
-  }
+  if ( nk_button_label( app->nk, "Apply Configuration" ) && !worker_busy ) apply_network_config( app );
 
   nk_end( app->nk );
 }

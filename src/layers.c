@@ -67,6 +67,12 @@ static _tensor_t *dense_backward( _ds_arena_t_ *arena, _layer_t *self, _tensor_t
     return NULL;
   }
 
+  if ( output_gradients->shape[0] != input->shape[0] )
+  {
+    fprintf( stderr, "dense_backward: gradient batch %d != cached input batch %d\n", output_gradients->shape[0], input->shape[0] );
+    return NULL;
+  }
+
   int batch_size = input->shape[0];
   int features = input->shape[1];
   int out_dimension = self->out_shape.dims[1]; /* ✅ */
@@ -135,6 +141,12 @@ static _tensor_t *sigmoid_backward( _ds_arena_t_ *arena, _layer_t *self, _tensor
     return NULL;
   }
 
+  if ( output_gradient->size != sigmoid_out->size )
+  {
+    fprintf( stderr, "sigmoid_backward: gradient size %d != cached output size %d\n", output_gradient->size, sigmoid_out->size );
+    return NULL;
+  }
+
   _tensor_t *input_gradients = tensor_zeros( arena, sigmoid_out->dimension, sigmoid_out->shape );
   if ( !input_gradients ) return NULL;
 
@@ -183,6 +195,12 @@ static _tensor_t *relu_backward( _ds_arena_t_ *arena, _layer_t *self, _tensor_t 
   if ( !input )
   {
     fprintf( stderr, "relu_backward: cache is NULL\n" );
+    return NULL;
+  }
+
+  if ( output_gradient->size != input->size )
+  {
+    fprintf( stderr, "relu_backward: gradient size %d != cached output size %d\n", output_gradient->size, input->size );
     return NULL;
   }
 

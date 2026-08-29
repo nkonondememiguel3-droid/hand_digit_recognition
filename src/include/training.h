@@ -73,7 +73,9 @@ typedef struct
   __dataset__ *test_ds;
   _training_config_t config;
 
-  _ds_arena_t_ weight_arena;
+  /* Scratch arena for one run's activations and batches. Created by the
+     caller before training_start(); destroyed by the training thread when
+     the run ends, so the caller must not touch it afterwards. */
   _ds_arena_t_ batch_arena;
 } _training_ctx_t;
 
@@ -93,8 +95,12 @@ extern void training_state_destroy( _training_state_t *state );
 /*
  * training_start - spawn the training thread.
  *
- * Returns the SDL_Thread handle. The caller must eventually call
- * SDL_WaitThread() on it to join cleanly.
+ * Takes ownership of ctx->batch_arena: the thread destroys it when the run
+ * ends, and training_start destroys it itself if the thread cannot start.
+ *
+ * Returns the SDL_Thread handle, or NULL if the thread could not be created
+ * (in which case is_training is left false). The caller must eventually call
+ * SDL_WaitThread() on a non-NULL handle to join cleanly.
  *
  * ctx must remain valid for the entire duration of the thread.
  * ctx->state->should_stop = true signals the thread to exit early.

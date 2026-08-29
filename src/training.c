@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /* -  Internal: build a one-hot (or label-smoothed) label batch
  *
@@ -38,13 +37,14 @@ static _tensor_t *build_label_batch( _ds_arena_t_ *arena, __dataset__ *ds, int b
 
     // TODO: do not rely on the actual value of the label('cause this is specific for MNIST dataset), instead rely on the index of the labels array so
     // it can be generalize.
-    int cls = (int)lbl->data[0];
-    // silently remove invalide classes
-    if ( cls < 0 || cls >= num_classes ) continue;
-
-    // fill smoothed baseline first
+    // fill the smoothed baseline for every sample, including ones whose
+    // label turns out to be unusable
     if ( smoothing > 0.0f )
       for ( int j = 0; j < num_classes; j++ ) T2( labels, s, j ) = smooth_val;
+
+    int cls = (int)lbl->data[0];
+    // silently skip invalid classes
+    if ( cls < 0 || cls >= num_classes ) continue;
 
     T2( labels, s, cls ) = correct_val;
   }
@@ -139,10 +139,19 @@ static int training_thread_fn( void *userdata )
 
   int total_images = (int)ds->image_header.count;
   int img_pixels = IMG_WIDTH * IMG_HEIGHT;
-  int total_batches = total_images / cfg.batch_size;
 
-  /* Seed random per thread so weights initialise differently each run */
-  srand( (unsigned int)time( NULL ) );
+  if ( cfg.batch_size < 1 )
+  {
+    fprintf( stderr, "training: batch size %d is invalid\n", cfg.batch_size );
+    goto training_done;
+  }
+
+  int total_batches = total_images / cfg.batch_size;
+  if ( total_batches < 1 )
+  {
+    fprintf( stderr, "training: dataset holds %d images, fewer than one batch of %d\n", total_images, cfg.batch_size );
+    goto training_done;
+  }
 
   /* Epoch loop */
   for ( int epoch = 1; epoch <= cfg.epochs; epoch++ )
@@ -222,7 +231,9 @@ static int training_thread_fn( void *userdata )
       state->total_epochs = cfg.epochs;
       state->batch = b + 1;
       state->total_batches = total_batches;
-      push_metric( state, batch_loss, 0.0f ); // acc updated per epoch
+      /* accuracy is only measured per epoch -- carry the last value so the
+         chart is a step, not a spike back to zero on every batch */
+      push_metric( state, batch_loss, state->epoch_acc );
       SDL_UnlockMutex( state->mutex );
 
       // log to stdout every 100 batches
@@ -246,6 +257,9 @@ static int training_thread_fn( void *userdata )
   }
 
 training_done:
+  /* The batch arena is created for this run and owned by this thread */
+  ds_arena_destroy( &ctx->batch_arena );
+
   SDL_LockMutex( state->mutex );
   state->is_training = false;
   SDL_UnlockMutex( state->mutex );
@@ -289,11 +303,26 @@ SDL_Thread *training_start( _training_ctx_t *ctx )
   ctx->state->is_paused = false;
   ctx->state->epoch = 0;
   ctx->state->batch = 0;
+  ctx->state->epoch_loss = 0.0f;
+  ctx->state->epoch_acc = 0.0f;
   ctx->state->history_head = 0;
   ctx->state->history_count = 0;
   SDL_UnlockMutex( ctx->state->mutex );
 
-  return SDL_CreateThread( training_thread_fn, "training", ctx );
+  SDL_Thread *thread = SDL_CreateThread( training_thread_fn, "training", ctx );
+  if ( !thread )
+  {
+    /* Nothing will run, so nothing will clear the flag or release the arena */
+    fprintf( stderr, "training_start: SDL_CreateThread failed: %s\n", SDL_GetError() );
+
+    ds_arena_destroy( &ctx->batch_arena );
+
+    SDL_LockMutex( ctx->state->mutex );
+    ctx->state->is_training = false;
+    SDL_UnlockMutex( ctx->state->mutex );
+  }
+
+  return thread;
 }
 
 void training_stop( SDL_Thread *thread, _training_state_t *state )

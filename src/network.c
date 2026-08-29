@@ -55,6 +55,31 @@ static _tensor_t *network_forward( _network_t *self, _ds_arena_t_ *batch_arena, 
   return current;
 }
 
+/* Route `grad` back to a skip source.
+ *
+ * A skip destination computes  out_dest = f_dest(in_dest) + out_source,
+ * so the gradient reaching the destination's output flows unchanged into
+ * the source's output as well. It is accumulated (not overwritten) because
+ * several destinations may share one source.
+ *
+ * A copy is taken rather than a reference: the gradient tensor the caller
+ * holds is folded into and mutated further down the chain.
+ */
+static bool accumulate_skip_gradient( _ds_arena_t_ *batch_arena, _network_node_t *source, const _tensor_t *grad )
+{
+  if ( source->skip_gradients == NULL )
+  {
+    source->skip_gradients = tensor_zeros( batch_arena, grad->dimension, grad->shape );
+    if ( !source->skip_gradients )
+    {
+      fprintf( stderr, "network_backward: failed to allocate skip gradients for '%s'\n", source->layer->layer_name );
+      return false;
+    }
+  }
+
+  return tensor_add_inplace( source->skip_gradients, grad );
+}
+
 static _tensor_t *network_backward( _network_t *self, _ds_arena_t_ *batch_arena, _tensor_t *loss_gradients )
 {
   if ( !self || !loss_gradients )
@@ -63,19 +88,34 @@ static _tensor_t *network_backward( _network_t *self, _ds_arena_t_ *batch_arena,
     return NULL;
   }
 
+  /* Skip gradients live for exactly one backward pass */
+  for ( _network_node_t *n = self->head; n != NULL; n = n->next ) n->skip_gradients = NULL;
+
   _tensor_t *grad = loss_gradients;
   _network_node_t *node = self->tail;
 
   while ( node != NULL )
   {
-    _network_node_t *scan = node->next;
-    while ( scan != NULL )
+    /* Gradient routed back from every layer that used this node as a skip
+       source. Folded in first, so a node that is both a destination and a
+       source passes the complete gradient on.                            */
+    if ( node->skip_gradients != NULL )
     {
-      if ( scan->skip_source == node )
+      if ( !tensor_add_inplace( grad, node->skip_gradients ) )
       {
-        if ( scan->output ) tensor_add_inplace( grad, scan->output );
+        fprintf( stderr, "network_backward: skip gradient shape mismatch at '%s'\n", node->layer->layer_name );
+        return NULL;
       }
-      scan = scan->next;
+      node->skip_gradients = NULL;
+    }
+
+    if ( node->skip_source != NULL )
+    {
+      if ( !accumulate_skip_gradient( batch_arena, node->skip_source, grad ) )
+      {
+        fprintf( stderr, "network_backward: skip connection shape mismatch at '%s'\n", node->layer->layer_name );
+        return NULL;
+      }
     }
 
     _tensor_t *input_gradients = node->layer->backward( batch_arena, node->layer, grad );
@@ -110,6 +150,7 @@ void network_add_layer( _ds_arena_t_ *persist_arena, _network_t *network, _layer
   node->layer = layer;
   node->output = NULL;
   node->skip_source = NULL;
+  node->skip_gradients = NULL;
   node->next = NULL;
   node->prev = network->tail;
 

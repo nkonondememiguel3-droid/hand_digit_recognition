@@ -7,6 +7,12 @@
 
 #include "ds_arena.h"
 
+/* M_PI is a POSIX extension, not standard C11 -- define it if the
+   toolchain is in strict-conformance mode. */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 static void compute_strides( _tensor_t *t )
 {
   t->strides[t->dimension - 1] = 1;
@@ -113,10 +119,10 @@ _tensor_t *tensor_random_normal( _ds_arena_t_ *a, int dimension, const int *shap
   return t;
 }
 
-
 _tensor_t *tensor_random_uniform( _ds_arena_t_ *arena, int ndim, const int *shape, float min, float max, bool gradient_required )
 {
   _tensor_t *t = tensor_create( arena, ndim, shape, gradient_required );
+  if ( !t ) return NULL;
 
   float range = max - min;
 

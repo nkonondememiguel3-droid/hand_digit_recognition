@@ -49,13 +49,19 @@ _optimizer_t *optimizer_create_sgd( _ds_arena_t_ *arena, _network_t *network, _s
   while ( node )
   {
     _layer_t *l = node->layer;
-    if ( l->weights ) opt->sgd_velocities_w[idx] = ARENA_ARRAY( arena, float, l->weights->size );
-    else opt->sgd_velocities_w[idx] = NULL;
 
-    if ( l->bias ) opt->sgd_velocities_b[idx] = ARENA_ARRAY( arena, float, l->bias->size );
-    else opt->sgd_velocities_b[idx] = NULL;
+    /* Parameterless layers own no slot -- writing one here would run off
+       the end of the arrays when the network ends in an activation. */
+    if ( !l->weights && !l->bias )
+    {
+      node = node->next;
+      continue;
+    }
 
-    if ( l->weights || l->bias ) idx++;
+    opt->sgd_velocities_w[idx] = l->weights ? ARENA_ARRAY( arena, float, l->weights->size ) : NULL;
+    opt->sgd_velocities_b[idx] = l->bias ? ARENA_ARRAY( arena, float, l->bias->size ) : NULL;
+
+    idx++;
     node = node->next;
   }
 
@@ -93,6 +99,13 @@ _optimizer_t *optimizer_create_adam( _ds_arena_t_ *arena, _network_t *network, _
   {
     _layer_t *l = node->layer;
 
+    /* See optimizer_create_sgd: only parameterized layers own a slot. */
+    if ( !l->weights && !l->bias )
+    {
+      node = node->next;
+      continue;
+    }
+
     if ( l->weights )
     {
       opt->adam_states[idx].weights.size = l->weights->size;
@@ -119,7 +132,7 @@ _optimizer_t *optimizer_create_adam( _ds_arena_t_ *arena, _network_t *network, _
       opt->adam_states[idx].bias.v = NULL;
     }
 
-    if ( l->weights || l->bias ) idx++;
+    idx++;
     node = node->next;
   }
 

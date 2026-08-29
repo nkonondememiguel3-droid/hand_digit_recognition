@@ -7,6 +7,7 @@
 #include <criterion/internal/assert.h>
 #include <criterion/internal/test.h>
 #include <math.h>
+#include <stdbool.h>
 
 static _ds_arena_t_ param_arena;
 static _ds_arena_t_ batch_arena;
@@ -451,4 +452,123 @@ Test( network, arena_checkpoint_reset_after_batch )
 
   size_t used_after = batch_arena.head ? batch_arena.head->chunk_size_used : 0;
   cr_assert_eq( used_after, cp.checkpoint_size_used, "Batch arena should return to checkpoint after reset" );
+}
+
+/* ── Skip connections ─────────────────────────────────────────────────────
+ *
+ * A skip destination computes  out = f(in) + out_source, so the gradient
+ * arriving at the destination must flow back into the source unchanged.
+ * These check the gradient numerically: the network's own backward pass has
+ * to agree with a central finite difference of the loss.
+ */
+
+#define SKIP_DIM 3
+
+/* Loss = Σ w·out, so dL/dout = w and the gradient wrt the input is exactly
+   what network_backward should return. */
+static float skip_probe_loss( _network_t *net, _ds_arena_t_ *arena, const float *x, const float *w )
+{
+  _ds_arena_checkpoint_t_ cp = ds_arena_checkpoint( arena );
+
+  int shape[] = { 1, SKIP_DIM };
+  _tensor_t *in = tensor_zeros( arena, 2, shape );
+  for ( int i = 0; i < SKIP_DIM; i++ ) in->data[i] = x[i];
+
+  _tensor_t *out = net->forward( net, arena, in );
+
+  float loss = 0.0f;
+  for ( int i = 0; i < SKIP_DIM; i++ ) loss += w[i] * out->data[i];
+
+  ds_arena_reset_to( arena, cp );
+  return loss;
+}
+
+/* dense -> relu -> dense, optionally with a skip from the first dense to the
+   second. Both dense layers are square so the skip shapes line up. */
+static _network_t *make_skip_network( _ds_arena_t_ *a, bool with_skip )
+{
+  _network_t *net = network_create( a );
+
+  network_add_layer( a, net, layer_create_dense( a, SKIP_DIM, SKIP_DIM ) );
+  _network_node_t *source = net->tail;
+
+  network_add_layer( a, net, layer_create_relu( a ) );
+
+  network_add_layer( a, net, layer_create_dense( a, SKIP_DIM, SKIP_DIM ) );
+  _network_node_t *destination = net->tail;
+
+  if ( with_skip ) network_add_skip( source, destination );
+  return net;
+}
+
+static void assert_input_gradient_matches_finite_difference( bool with_skip )
+{
+  _network_t *net = make_skip_network( &param_arena, with_skip );
+
+  const float w[SKIP_DIM] = { 0.3f, 0.5f, 0.7f };
+  float x[SKIP_DIM] = { 0.5f, -0.25f, 0.8f };
+
+  int shape[] = { 1, SKIP_DIM };
+  _tensor_t *input = tensor_zeros( &batch_arena, 2, shape );
+  for ( int i = 0; i < SKIP_DIM; i++ ) input->data[i] = x[i];
+
+  net->forward( net, &batch_arena, input );
+
+  _tensor_t *output_gradients = tensor_zeros( &batch_arena, 2, shape );
+  for ( int i = 0; i < SKIP_DIM; i++ ) output_gradients->data[i] = w[i];
+
+  network_zero_gradients( net );
+  _tensor_t *input_gradients = net->backward( net, &batch_arena, output_gradients );
+  cr_assert_not_null( input_gradients );
+
+  const float eps = 1e-3f;
+  for ( int i = 0; i < SKIP_DIM; i++ )
+  {
+    float saved = x[i];
+
+    x[i] = saved + eps;
+    float plus = skip_probe_loss( net, &batch_arena, x, w );
+
+    x[i] = saved - eps;
+    float minus = skip_probe_loss( net, &batch_arena, x, w );
+
+    x[i] = saved;
+
+    float numeric = ( plus - minus ) / ( 2.0f * eps );
+    float analytic = input_gradients->data[i];
+
+    cr_assert_float_eq( analytic, numeric, 1e-2f, "d/dx[%d]: backward gave %.6f, finite difference gave %.6f%s", i, (double)analytic, (double)numeric,
+                        with_skip ? " (with skip connection)" : "" );
+  }
+}
+
+Test( network, backward_matches_finite_difference_without_skip )
+{
+  assert_input_gradient_matches_finite_difference( false );
+}
+
+Test( network, backward_matches_finite_difference_with_skip )
+{
+  /* Regression: backward used to fold the skip destination's forward
+     activations into the gradient instead of the gradient itself. */
+  assert_input_gradient_matches_finite_difference( true );
+}
+
+Test( network, skip_gradients_are_cleared_between_passes )
+{
+  _network_t *net = make_skip_network( &param_arena, true );
+
+  int shape[] = { 1, SKIP_DIM };
+  _tensor_t *input = tensor_ones( &batch_arena, 2, shape );
+  _tensor_t *output_gradients = tensor_ones( &batch_arena, 2, shape );
+
+  for ( int pass = 0; pass < 2; pass++ )
+  {
+    net->forward( net, &batch_arena, input );
+    network_zero_gradients( net );
+    cr_assert_not_null( net->backward( net, &batch_arena, output_gradients ) );
+  }
+
+  for ( _network_node_t *node = net->head; node != NULL; node = node->next )
+    cr_assert_null( node->skip_gradients, "skip gradients must not survive a backward pass" );
 }
